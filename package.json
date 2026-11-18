@@ -1,0 +1,21 @@
+{
+  "name": "core-archive-collector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "区域岩芯资料馆：岩芯鉴定采集服务（模拟站点 + DuckDB 本地存储 + HTTP 查询/进度接口）",
+  "scripts": {
+    "mock": "tsx src/mock/site.ts",
+    "serve": "tsx src/main.ts",
+    "verify": "tsx scripts/verify.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "duckdb": "^1.4.4"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "@types/node": "^22.10.0"
+  }
+}

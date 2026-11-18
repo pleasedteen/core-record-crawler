@@ -1,0 +1,8 @@
+node_modules/
+data/
+data-verify/
+data-smoke/
+*.duckdb
+*.duckdb.wal
+*.log
+.DS_Store
