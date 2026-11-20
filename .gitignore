@@ -6,3 +6,4 @@ data-smoke/
 *.duckdb.wal
 *.log
 .DS_Store
+data-backlog/

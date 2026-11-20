@@ -11,6 +11,7 @@ import path from "node:path";
 import { config } from "./config.js";
 import { openDatabase } from "./db.js";
 import { HttpFetcher } from "./collect/http.js";
+import { DetailScheduler } from "./collect/scheduler.js";
 import { Collector } from "./collect/collector.js";
 import { startApiServer } from "./api.js";
 import { MockArchiveSite } from "./mock/site.js";
@@ -39,7 +40,8 @@ async function main(): Promise<void> {
 
   const db = await openDatabase();
   const fetcher = new HttpFetcher();
-  const collector = new Collector(db, fetcher, baseUrl);
+  const scheduler = new DetailScheduler(db, fetcher, baseUrl);
+  const collector = new Collector(db, fetcher, baseUrl, scheduler);
   const apiServer = startApiServer(db, collector);
 
   await collector.start(config.autoFull);

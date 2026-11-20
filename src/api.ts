@@ -113,6 +113,12 @@ export function createApiServer(db: Database, collector: Collector): http.Server
         });
       }
 
+      // 详情调度明细（窗口驻留 / 已安排的复查/退避时刻）
+      if (p === "/schedule" && req.method === "GET") {
+        const coreId = url.searchParams.get("coreId") ?? undefined;
+        return json(res, 200, await collector.snapshotSchedule(coreId));
+      }
+
       // 采集进度
       if (p === "/progress" && req.method === "GET") {
         const snap = await collector.snapshot();

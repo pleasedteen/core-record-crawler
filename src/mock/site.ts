@@ -309,7 +309,8 @@ ${history}
         res.end(body);
       };
 
-      const fault = this.transientFault();
+      // 管理接口（离线验证用）不受临时故障注入影响，保证时序可控
+      const fault = url.pathname.startsWith("/__admin/") ? null : this.transientFault();
       if (fault) {
         if (fault.status === 503) {
           send(503, `服务临时繁忙，请 ${fault.retryAfter} 秒后重试`, "text/plain", {

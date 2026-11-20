@@ -21,6 +21,8 @@ export class HttpError extends Error {
     message: string,
     readonly status: number | null,
     readonly retriable: boolean,
+    /** 站点要求的最短等待（毫秒）；无则为 null。 */
+    readonly retryAfterMs: number | null = null,
   ) {
     super(message);
     this.name = "HttpError";
@@ -147,6 +149,7 @@ export class HttpFetcher {
           `临时拒绝 ${result.status}${raMs !== null ? `（Retry-After ${Math.round(raMs)}ms）` : ""}`,
           result.status,
           true,
+          raMs,
         );
         if (attempt > config.maxRetries) break;
         this.stats.retried += 1;
@@ -166,6 +169,36 @@ export class HttpFetcher {
       return result;
     }
     throw lastError ?? new HttpError(`请求失败（已重试 ${attempt - 1} 次）: ${url}`, null, true);
+  }
+
+  /**
+   * 单次尝试版 GET：不做进程内长退避，交给调度器按“地址”安排持久化退避。
+   * 仍然共用速率窗口、在途上限，并在 503/429 时设置全局 Retry-After 暂停。
+   */
+  async fetchOnce(url: string): Promise<FetchResult> {
+    const result = await this.dispatch(url);
+    if (result.status === 503 || result.status === 429) {
+      const raMs = this.parseRetryAfter(result.headers["retry-after"]);
+      if (raMs !== null) this.applyRetryAfter(raMs);
+      throw new HttpError(
+        `临时拒绝 ${result.status}${raMs !== null ? `（Retry-After ${Math.round(raMs)}ms）` : ""}`,
+        result.status,
+        true,
+        raMs,
+      );
+    }
+    if (result.status >= 500) {
+      throw new HttpError(`服务端临时错误 ${result.status}`, result.status, true);
+    }
+    if (result.status >= 400) {
+      throw new HttpError(`不可重试的客户端错误 ${result.status}: ${url}`, result.status, false);
+    }
+    return result;
+  }
+
+  /** 全局暂停的剩余毫秒数（用于调度器休眠计算）。 */
+  pausedFor(): number {
+    return Math.max(0, this.pausedUntil - Date.now());
   }
 
   private async backoff(attempt: number, retryAfterMs: number | null): Promise<void> {

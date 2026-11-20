@@ -8,6 +8,7 @@
     "mock": "tsx src/mock/site.ts",
     "serve": "tsx src/main.ts",
     "verify": "tsx scripts/verify.ts",
+    "verify:backlog": "tsx scripts/verify-backlog.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

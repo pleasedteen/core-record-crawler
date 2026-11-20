@@ -34,6 +34,28 @@ export interface IdentificationRow {
   updated_at: string;
 }
 
+export interface ScheduleRow {
+  core_id: string;
+  /** QUEUED（可请求）/ RUNNING（在执行）/ WAITING（等待复查或退避） */
+  state: "QUEUED" | "RUNNING" | "WAITING";
+  /** WAITING 的原因：RECHECK（详情滞后）/ BACKOFF（请求失败退避） */
+  reason: "RECHECK" | "BACKOFF" | null;
+  attempts: number;
+  /** 下次允许请求的时间（退避/复查截止）。强杀重启后据此继续等待。 */
+  next_attempt_at: string | Date;
+  last_error: string | null;
+  updated_at: string | Date;
+}
+
+/** 把 DuckDB 返回的 TIMESTAMP（Date 或字符串）统一转成毫秒。 */
+export function timestampMs(value: string | Date | null | undefined): number {
+  if (value === null || value === undefined) return 0;
+  if (value instanceof Date) return value.getTime();
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+
 export interface RunStateRow {
   active_run_id: number | null;
   mode: string | null;
@@ -138,6 +160,28 @@ CREATE TABLE IF NOT EXISTS run_state (
   full_completed_at             TIMESTAMP,
   last_catchup_at               TIMESTAMP,
   updated_at                    TIMESTAMP NOT NULL
+);
+
+-- 详情地址调度表：只保存当前内存窗口内的地址（调度器确保不超过 64 条）。
+-- 进程被强制结束后，重启据此继续遵守原有的复查与退避时间。
+CREATE TABLE IF NOT EXISTS detail_schedule (
+  core_id          VARCHAR   NOT NULL PRIMARY KEY,
+  state            VARCHAR   NOT NULL DEFAULT 'QUEUED',
+  reason           VARCHAR,
+  attempts         INTEGER   NOT NULL DEFAULT 0,
+  next_attempt_at  TIMESTAMP NOT NULL,
+  last_error       VARCHAR,
+  updated_at       TIMESTAMP NOT NULL
+);
+
+-- 积压时被暂时换出内存窗口的等待中地址：保留原复查/退避时刻，到点再入窗口。
+CREATE TABLE IF NOT EXISTS detail_deferred (
+  core_id          VARCHAR   NOT NULL PRIMARY KEY,
+  reason           VARCHAR,
+  attempts         INTEGER   NOT NULL DEFAULT 0,
+  next_attempt_at  TIMESTAMP NOT NULL,
+  last_error       VARCHAR,
+  updated_at       TIMESTAMP NOT NULL
 );
 `;
 
@@ -265,6 +309,56 @@ export class Database {
     );
   }
 
+  /**
+   * 批量登记已发布修订（更正列表分页整页写入）。
+   * 已存在的行不覆盖核实状态；目录先发现（published_seq = 0）时回填发布序号。
+   * 同一页内重复键先去重，避免 MERGE 源内重复。
+   */
+  async upsertPublishedRevisionsBatch(
+    inputs: Array<{
+      coreId: string;
+      revision: number;
+      publishedSeq: number;
+      publishedAt: string;
+      detailReadySeq: number | null;
+    }>,
+  ): Promise<number> {
+    const unique = new Map<string, (typeof inputs)[number]>();
+    for (const input of inputs) {
+      const key = `${input.coreId}\u0000${input.revision}`;
+      if (!unique.has(key)) unique.set(key, input);
+    }
+    const rows = [...unique.values()];
+    if (rows.length === 0) return 0;
+
+    let inserted = 0;
+    const CHUNK = 400;
+    for (let start = 0; start < rows.length; start += CHUNK) {
+      const chunk = rows.slice(start, start + CHUNK);
+      const values: string[] = [];
+      const params: unknown[] = [];
+      for (const row of chunk) {
+        values.push("(?, ?, ?, ?)");
+        params.push(row.coreId, row.revision, row.publishedSeq, row.publishedAt);
+      }
+      await this.exec(
+        `MERGE INTO identifications AS t
+         USING (VALUES ${values.join(", ")}) AS s(core_id, revision, published_seq, published_at)
+         ON t.core_id = s.core_id AND t.revision = s.revision
+         WHEN MATCHED AND t.published_seq <= 0 AND s.published_seq > 0 THEN
+           UPDATE SET published_seq = s.published_seq, published_at = s.published_at,
+                      updated_at = now()
+         WHEN NOT MATCHED THEN
+           INSERT (core_id, revision, published_seq, published_at, detail_ready_seq,
+                   status, attempts, updated_at)
+           VALUES (s.core_id, s.revision, s.published_seq, s.published_at, NULL, 'PENDING', 0, now())`,
+        params,
+      );
+      inserted += chunk.length;
+    }
+    return inserted;
+  }
+
   /** 记录一次详情抓取尝试。 */
   async recordAttempt(coreId: string, revision: number, error: string | null): Promise<void> {
     await this.exec(
@@ -323,6 +417,345 @@ export class Database {
     return this.all<IdentificationRow>(
       `SELECT * FROM identifications WHERE status = 'PENDING' ORDER BY published_seq, core_id, revision`,
     );
+  }
+
+  /** 某岩芯当前全部待核实修订（同一详情地址共用一次复查）。 */
+  async listPendingForCore(coreId: string): Promise<IdentificationRow[]> {
+    return this.all<IdentificationRow>(
+      `SELECT * FROM identifications
+        WHERE core_id = ? AND status = 'PENDING'
+        ORDER BY revision`,
+      [coreId],
+    );
+  }
+
+  async countPendingCores(): Promise<number> {
+    const row = await this.one<{ n: number }>(
+      `SELECT CAST(COUNT(DISTINCT core_id) AS INTEGER) AS n
+         FROM identifications WHERE status = 'PENDING'`,
+    );
+    return Number(row?.n ?? 0);
+  }
+
+  // ---------- 详情调度表（固定窗口 + 持久化） ----------
+  //
+  // detail_schedule 只保存“内存窗口”内的地址（数量由调度器钳制在 64 以内）。
+  // 积压的其它地址仍留在 identifications 中，按需要分批进入窗口；
+  // 被窗口暂时换出的等待中地址落在 detail_deferred，保留原复查/退避时刻，
+  // 因此进程被强杀重启后也不会提前请求。
+
+  async residentSchedules(): Promise<ScheduleRow[]> {
+    return this.all<ScheduleRow>(
+      `SELECT * FROM detail_schedule
+        ORDER BY CASE state WHEN 'RUNNING' THEN 0 WHEN 'QUEUED' THEN 1 ELSE 2 END,
+                 next_attempt_at, core_id`,
+    );
+  }
+
+  async residentScheduleCount(): Promise<number> {
+    // 注意：DuckDB 对非空 PRIMARY KEY 的表用 COUNT(*) 会走较慢的计划，
+    // COUNT(core_id) 语义相同且快两个数量级（调度器巡检是热路径）。
+    const row = await this.one<{ n: number }>(
+      `SELECT CAST(COUNT(core_id) AS INTEGER) AS n FROM detail_schedule`,
+    );
+    return Number(row?.n ?? 0);
+  }
+
+  async scheduleStateCounts(): Promise<{
+    queued: number;
+    running: number;
+    waiting: number;
+  }> {
+    const row = await this.one<{
+      queued: number;
+      running: number;
+      waiting: number;
+    }>(
+      `SELECT CAST(COUNT(core_id) FILTER (WHERE state = 'QUEUED')  AS INTEGER) AS queued,
+              CAST(COUNT(core_id) FILTER (WHERE state = 'RUNNING') AS INTEGER) AS running,
+              CAST(COUNT(core_id) FILTER (WHERE state = 'WAITING') AS INTEGER) AS waiting
+         FROM detail_schedule`,
+    );
+    return {
+      queued: Number(row?.queued ?? 0),
+      running: Number(row?.running ?? 0),
+      waiting: Number(row?.waiting ?? 0),
+    };
+  }
+
+  async deferredSchedules(): Promise<ScheduleRow[]> {
+    const rows = await this.all<{
+      core_id: string;
+      reason: ScheduleRow["reason"];
+      attempts: number;
+      next_attempt_at: string | Date;
+      last_error: string | null;
+      updated_at: string | Date;
+    }>(`SELECT * FROM detail_deferred ORDER BY next_attempt_at, core_id`);
+    return rows.map((r) => ({ ...r, state: "WAITING" as const }));
+  }
+
+  async deferredScheduleCount(): Promise<number> {
+    const row = await this.one<{ n: number }>(
+      `SELECT CAST(COUNT(core_id) AS INTEGER) AS n FROM detail_deferred`,
+    );
+    return Number(row?.n ?? 0);
+  }
+
+  /**
+   * 批量认领到点地址：单条 UPDATE ... RETURNING，避免逐条写模型开销。
+   * 排序规则：
+   *   1) 已安排过复查/退避的地址（attempts > 0）优先——它们代表“已承诺的时刻”，
+   *      不能被源源不断的新积压挤掉；
+   *   2) 其次按原定等待时刻、地址稳定排序。
+   */
+  async claimQueuedBatch(limit: number): Promise<ScheduleRow[]> {
+    if (limit <= 0) return [];
+    return this.all<ScheduleRow>(
+      `UPDATE detail_schedule
+          SET state = 'RUNNING', reason = NULL, updated_at = now()
+        WHERE core_id IN (
+          SELECT core_id FROM detail_schedule
+           WHERE state = 'QUEUED' AND next_attempt_at <= now()
+           ORDER BY (attempts > 0) DESC, next_attempt_at, core_id
+           LIMIT ?
+        )
+      RETURNING *`,
+      [limit],
+    );
+  }
+
+  /** 等待中的地址到点后重新入队。 */
+  async requeueDueWaiting(): Promise<number> {
+    const rows = await this.all<{ core_id: string }>(
+      `UPDATE detail_schedule
+          SET state = 'QUEUED', updated_at = now()
+        WHERE state = 'WAITING' AND next_attempt_at <= now()
+      RETURNING core_id`,
+    );
+    return rows.length;
+  }
+
+  /**
+   * 重启恢复：残留的 RUNNING 表示强杀时正在执行的请求，立即重新排队即可
+   * （它原本的 next_attempt_at 已到点，重试不违反任何已安排的等待）。
+   * WAITING（已安排复查/退避）与 detail_deferred 原样保留，重启后继续等到原时刻。
+   */
+  async recoverSchedulesAfterRestart(): Promise<{ requeued: number; waiting: number }> {
+    const requeued = await this.all<{ core_id: string }>(
+      `UPDATE detail_schedule
+          SET state = 'QUEUED', reason = NULL, next_attempt_at = now(), updated_at = now()
+        WHERE state = 'RUNNING'
+      RETURNING core_id`,
+    );
+    const waiting = await this.one<{ n: number }>(
+      `SELECT CAST(COUNT(core_id) AS INTEGER) AS n
+         FROM detail_schedule WHERE state = 'WAITING'`,
+    );
+    return { requeued: requeued.length, waiting: Number(waiting?.n ?? 0) };
+  }
+
+  /** 详情仍滞后：持久化复查时刻。 */
+  async scheduleRecheck(coreId: string, nextAtMs: number, error: string | null): Promise<void> {
+    await this.exec(
+      `UPDATE detail_schedule
+          SET state = 'WAITING', reason = 'RECHECK', attempts = attempts + 1,
+              next_attempt_at = ?, last_error = ?, updated_at = now()
+        WHERE core_id = ?`,
+      [new Date(nextAtMs).toISOString(), error, coreId],
+    );
+  }
+
+  /** 请求失败：持久化指数退避时刻。 */
+  async scheduleBackoff(coreId: string, nextAtMs: number, error: string | null): Promise<void> {
+    await this.exec(
+      `UPDATE detail_schedule
+          SET state = 'WAITING', reason = 'BACKOFF', attempts = attempts + 1,
+              next_attempt_at = ?, last_error = ?, updated_at = now()
+        WHERE core_id = ?`,
+      [new Date(nextAtMs).toISOString(), error, coreId],
+    );
+  }
+
+  /** 地址全部核实完成：移出窗口，同时清理延迟表。 */
+  async removeSchedule(coreId: string): Promise<void> {
+    await this.exec(`DELETE FROM detail_schedule WHERE core_id = ?`, [coreId]);
+    await this.exec(`DELETE FROM detail_deferred WHERE core_id = ?`, [coreId]);
+  }
+
+  /** 已到点的延迟地址（按原定时刻排序）。 */
+  async dueDeferred(limit: number): Promise<ScheduleRow[]> {
+    const rows = await this.all<{
+      core_id: string;
+      reason: ScheduleRow["reason"];
+      attempts: number;
+      next_attempt_at: string | Date;
+      last_error: string | null;
+      updated_at: string | Date;
+    }>(
+      `SELECT * FROM detail_deferred
+        WHERE next_attempt_at <= now()
+        ORDER BY next_attempt_at, core_id
+        LIMIT ?`,
+      [limit],
+    );
+    return rows.map((r) => ({ ...r, state: "WAITING" as const }));
+  }
+
+  /** 把一条延迟地址移回窗口（保留尝试次数与原定时刻）。 */
+  async admitDeferredRow(row: {
+    core_id: string;
+    reason: ScheduleRow["reason"];
+    attempts: number;
+    next_attempt_at: string | Date;
+    last_error: string | null;
+  }): Promise<void> {
+    const nowIso = new Date().toISOString();
+    await this.exec(
+      `INSERT INTO detail_schedule (core_id, state, reason, attempts, next_attempt_at, last_error, updated_at)
+       VALUES (?, 'QUEUED', ?, ?, ?, ?, ?)
+       ON CONFLICT (core_id) DO NOTHING`,
+      [
+        row.core_id,
+        row.reason,
+        row.attempts,
+        new Date(timestampMs(row.next_attempt_at)).toISOString(),
+        row.last_error,
+        nowIso,
+      ],
+    );
+    await this.exec(`DELETE FROM detail_deferred WHERE core_id = ?`, [row.core_id]);
+  }
+
+  /**
+   * 从未安排过的待核实地址里取候选：新发布的修订优先（追更用空闲额度核实），
+   * 其余按发布序号从新到旧，保证积压再多也不会饿死刚公布的更正。
+   */
+  async freshScheduleCandidates(
+    limit: number,
+  ): Promise<Array<{ core_id: string; priority: number }>> {
+    return this.all<{ core_id: string; priority: number }>(
+      `SELECT i.core_id, CAST(MIN(i.published_seq) AS INTEGER) AS priority
+         FROM identifications i
+        WHERE i.status = 'PENDING'
+          AND NOT EXISTS (SELECT 1 FROM detail_schedule s WHERE s.core_id = i.core_id)
+          AND NOT EXISTS (SELECT 1 FROM detail_deferred d WHERE d.core_id = i.core_id)
+        GROUP BY i.core_id
+        ORDER BY priority DESC, i.core_id
+        LIMIT ?`,
+      [limit],
+    );
+  }
+
+  /** 批量写入窗口（单条语句，减少万级积压下的写放大）。 */
+  async admitFreshBatch(coreIds: string[]): Promise<void> {
+    if (coreIds.length === 0) return;
+    const nowIso = new Date().toISOString();
+    const values = coreIds.map(() => "(?, 'QUEUED', NULL, 0, ?, NULL, ?)").join(", ");
+    const params: unknown[] = [];
+    for (const coreId of coreIds) params.push(coreId, nowIso, nowIso);
+    await this.exec(
+      `INSERT INTO detail_schedule (core_id, state, reason, attempts, next_attempt_at, last_error, updated_at)
+       VALUES ${values}
+       ON CONFLICT (core_id) DO NOTHING`,
+      params,
+    );
+  }
+
+  /**
+   * 一次换出多条“最久之后才需要复查”的等待地址到 detail_deferred，保留原时刻。
+   * 用单条语句完成，积压时避免逐条往返。
+   */
+  async evictFarthestWaitingBatch(limit: number): Promise<number> {
+    if (limit <= 0) return 0;
+    const victims = await this.all<{
+      core_id: string;
+      reason: ScheduleRow["reason"];
+      attempts: number;
+      next_attempt_at: string | Date;
+      last_error: string | null;
+    }>(
+      `SELECT core_id, reason, attempts, next_attempt_at, last_error
+         FROM detail_schedule
+        WHERE state = 'WAITING'
+        ORDER BY epoch_ms(next_attempt_at) DESC, core_id
+        LIMIT ?`,
+      [limit],
+    );
+    if (victims.length === 0) return 0;
+    const values = victims.map(() => "(?, ?, ?, ?, ?, now())").join(", ");
+    const params: unknown[] = [];
+    for (const v of victims) {
+      params.push(v.core_id, v.reason, v.attempts, new Date(timestampMs(v.next_attempt_at)).toISOString(), v.last_error);
+    }
+    await this.exec(
+      `INSERT INTO detail_deferred (core_id, reason, attempts, next_attempt_at, last_error, updated_at)
+       VALUES ${values}
+       ON CONFLICT (core_id) DO UPDATE SET
+         reason = excluded.reason,
+         attempts = excluded.attempts,
+         next_attempt_at = excluded.next_attempt_at,
+         last_error = excluded.last_error,
+         updated_at = now()`,
+      params,
+    );
+    await this.exec(
+      `DELETE FROM detail_schedule WHERE core_id IN (${victims.map(() => "?").join(", ")})`,
+      victims.map((v) => v.core_id),
+    );
+    return victims.length;
+  }
+
+  /** 清理已不再有待核实修订的调度/延迟行。 */
+  async pruneSchedules(): Promise<void> {
+    await this.exec(
+      `DELETE FROM detail_schedule
+        WHERE core_id NOT IN (SELECT DISTINCT core_id FROM identifications WHERE status = 'PENDING')`,
+    );
+    await this.exec(
+      `DELETE FROM detail_deferred
+        WHERE core_id NOT IN (SELECT DISTINCT core_id FROM identifications WHERE status = 'PENDING')`,
+    );
+  }
+
+  /**
+   * 把窗口压回上限以内：超出部分按“已安排优先、等待最久优先”保留，其余
+   * 等待中的地址换出到 detail_deferred（保留原时刻），排队中的地址退回积压。
+   * 只在下限被下调或升级后首次运行时可能用到；正常情况下窗口不会超限。
+   */
+  async enforceWindow(windowSize: number): Promise<number> {
+    const resident = await this.residentScheduleCount();
+    if (resident <= windowSize) return 0;
+    let excess = resident - windowSize;
+    let removed = 0;
+
+    // 1) 先换出等待中的地址（保留其复查/退避时刻）
+    const evicted = await this.evictFarthestWaitingBatch(excess);
+    removed += evicted;
+    excess -= evicted;
+
+    // 2) 仍超限：把最晚入队、且未执行过的排队地址退回积压
+    if (excess > 0) {
+      const rows = await this.all<{ core_id: string }>(
+        `SELECT core_id FROM detail_schedule
+          WHERE state = 'QUEUED' AND attempts = 0
+          ORDER BY epoch_ms(next_attempt_at) DESC, core_id DESC
+          LIMIT ?`,
+        [excess],
+      );
+      if (rows.length > 0) {
+        await this.exec(
+          `DELETE FROM detail_schedule WHERE core_id IN (${rows.map(() => "?").join(", ")})`,
+          rows.map((r) => r.core_id),
+        );
+        removed += rows.length;
+      }
+    }
+    return removed;
+  }
+
+  async getSchedule(coreId: string): Promise<ScheduleRow | null> {
+    return this.one<ScheduleRow>(`SELECT * FROM detail_schedule WHERE core_id = ?`, [coreId]);
   }
 
   async countByStatus(): Promise<{ verified: number; pending: number }> {

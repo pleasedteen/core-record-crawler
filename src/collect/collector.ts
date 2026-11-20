@@ -12,9 +12,10 @@
  * 已保存的核实结果原样沿用。
  */
 import { config } from "../config.js";
-import { Database, IdentificationRow } from "../db.js";
+import { Database } from "../db.js";
 import { HttpFetcher } from "./http.js";
-import { parseCatalog, parseCorrections, parseDetail, CatalogLink, CorrectionItem } from "./parse.js";
+import { parseCatalog, parseCorrections, CatalogLink, CorrectionItem } from "./parse.js";
+import { DetailScheduler, SchedulerStats } from "./scheduler.js";
 import { sleep } from "../util/rng.js";
 
 export interface ProgressSnapshot {
@@ -36,6 +37,8 @@ export interface ProgressSnapshot {
     verified: number;
     pending: number;
   };
+  /** 详情调度器状态：内存窗口（≤64）、延迟等待、积压。 */
+  schedule: SchedulerStats;
   /** 从上次进度开始连续核实到的最大发布序号（增量进度口径）。 */
   contiguousVerifiedSeq: number;
   fullCompleted: boolean;
@@ -59,6 +62,7 @@ export class Collector {
     private db: Database,
     private fetcher: HttpFetcher,
     private baseUrl: string,
+    private scheduler: DetailScheduler,
   ) {}
 
   async start(autoFull: boolean): Promise<void> {
@@ -69,6 +73,8 @@ export class Collector {
                        last_error = COALESCE(last_error, '进程被强制结束，重启后续跑')
         WHERE status = 'RUNNING'`,
     );
+    // 先启动详情调度器：已安排的复查/退避时刻从库里恢复，重启后照旧遵守。
+    await this.scheduler.start();
     const state = await this.db.getRunState();
     if (state.full_completed) {
       this.log(`检测到全量已完成（连续核实序号 ${state.last_contiguous_verified_seq}），进入增量模式`);
@@ -84,6 +90,7 @@ export class Collector {
   async shutdown(): Promise<void> {
     this.stopRequested = true;
     if (this.catchupTimer) clearTimeout(this.catchupTimer);
+    await this.scheduler.stop();
     // 等待当前运行循环让出
     const deadline = Date.now() + 3000;
     while (this.running && Date.now() < deadline) await sleep(50);
@@ -110,21 +117,26 @@ export class Collector {
 
       await this.crawlCatalog();
       await this.crawlCorrections();
-      // 详情可能滞后：多轮复查直到全部核实（每轮之间站点时钟会推进或重试退避）
-      let pass = 0;
+      // 详情核实交给后台调度器：积压时按固定窗口（≤64 个地址）分批推进，
+      // 退避/等待复查中的地址让出窗口，空闲额度用于其他地址。
+      // 积压未清空期间仍周期性重扫更正列表：追更登记的新修订用空闲额度核实。
+      this.log("目录与更正列表登记完成，开始按调度窗口核实详情");
+      let lastRescan = Date.now();
+      let drained = false;
       while (!this.stopRequested) {
-        pass += 1;
-        const pendingBefore = await this.db.listPending();
-        if (pendingBefore.length === 0) break;
-        this.log(`详情核实第 ${pass} 轮，待核实 ${pendingBefore.length} 条`);
-        await this.verifyPending(pendingBefore);
-        const still = await this.db.listPending();
-        if (still.length === 0) break;
-        this.log(`仍有 ${still.length} 条详情滞后，等待站点详情更新后复查`);
-        await sleep(500);
+        drained = await this.scheduler.drainPending({
+          timeoutMs: config.catchupIntervalMs,
+          shouldStop: () => this.stopRequested,
+        });
+        if (drained) break;
+        if (Date.now() - lastRescan >= config.catchupIntervalMs) {
+          lastRescan = Date.now();
+          const { newestSeq } = await this.crawlCorrections(true);
+          await this.db.saveRunState({ last_catchup_at: new Date().toISOString() });
+          this.log(`积压核实中追更正完成，站点已发布至 ${newestSeq}，待核实 ${(await this.db.countByStatus()).pending} 条`);
+        }
       }
-
-      if (this.stopRequested) {
+      if (!drained) {
         await this.db.finishRun(this.runId!, "INTERRUPTED", "收到停止信号");
         this.log("全量采集被中断，进度已保存，重启后续跑");
         return;
@@ -163,6 +175,7 @@ export class Collector {
     let dupCount = 0;
 
     while (!this.stopRequested) {
+      if (totalPages !== null && page > totalPages) break;
       const url = this.buildUrl(`/catalog?page=${page}`);
       if (await this.db.hasFetchedUrl(url)) {
         page += 1;
@@ -221,21 +234,24 @@ export class Collector {
     let newestSeq = state.last_contiguous_verified_seq;
 
     while (!this.stopRequested) {
+      if (!rescan && totalPages !== null && page > totalPages) break;
       const url = this.buildUrl(`/corrections?page=${page}`);
       const res = await this.fetcher.get(url);
       const parsed = parseCorrections(res.body);
       totalPages = parsed.totalPages;
       this.totalPublished = parsed.totalPublished;
 
-      for (const item of parsed.items) await this.registerCorrection(item);
-      const maxSeq = parsed.items.reduce((m, it) => Math.max(m, it.publishedSeq), newestSeq);
-      newestSeq = maxSeq;
+      const items = parsed.items;
+      newestSeq = items.reduce((m, it) => Math.max(m, it.publishedSeq), newestSeq);
 
+      await this.registerCorrectionsBatch(items);
       await this.db.recordUrl(url, "CORRECTIONS", "DONE", null);
       await this.db.saveRunState({
         correction_page_cursor: page,
         correction_total_pages: totalPages,
       });
+      // 新登记的修订立即参与调度（追更用空闲额度核实，等待中的地址让出窗口）
+      this.scheduler.notify();
       this.log(
         `${rescan ? "重扫" : "全量"}更正列表第 ${page}/${totalPages} 页完成` +
           `（本页 ${parsed.items.length} 条，已发布总数 ${parsed.totalPublished}）`,
@@ -246,100 +262,39 @@ export class Collector {
     return { newestSeq, totalPages };
   }
 
-  private async registerCorrection(item: CorrectionItem): Promise<void> {
-    const result = await this.db.upsertPublishedRevision({
-      coreId: item.coreId,
-      revision: item.revision,
-      publishedSeq: item.publishedSeq,
-      publishedAt: item.publishedAt,
-      detailReadySeq: null,
-    });
-    if (result === "inserted") {
-      this.log(`发现新发布修订：${item.coreId} r${item.revision}（发布序号 ${item.publishedSeq}，${item.note}）`);
+  private async registerCorrectionsBatch(items: CorrectionItem[]): Promise<void> {
+    if (items.length === 0) return;
+    const existing = new Set(
+      (
+        await this.db.all<{ core_id: string; revision: number }>(
+          `SELECT core_id, revision FROM identifications
+            WHERE core_id IN (${items.map(() => "?").join(",")})`,
+          [...new Set(items.map((i) => i.coreId))],
+        )
+      ).map((r) => `${r.core_id}\u0000${Number(r.revision)}`),
+    );
+    await this.db.upsertPublishedRevisionsBatch(
+      items.map((item) => ({
+        coreId: item.coreId,
+        revision: item.revision,
+        publishedSeq: item.publishedSeq,
+        publishedAt: item.publishedAt,
+        detailReadySeq: null,
+      })),
+    );
+    for (const item of items) {
+      if (!existing.has(`${item.coreId}\u0000${item.revision}`)) {
+        this.log(`发现新发布修订：${item.coreId} r${item.revision}（发布序号 ${item.publishedSeq}，${item.note}）`);
+      }
     }
   }
 
   // ---------------- 详情核实 ----------------
-
-  /**
-   * 并发核实待核实修订。
-   * 同一详情地址的多个待核实修订共享同一次响应：
-   * 同一待核实修订只合并采集一次，后续修订仍会触发复查（按 revision 各自判定）。
-   */
-  private async verifyPending(pending: IdentificationRow[]): Promise<void> {
-    const inFlight = new Map<string, Promise<void>>();
-    const workers = Math.max(1, config.maxInflight);
-    let idx = 0;
-
-    const worker = async (): Promise<void> => {
-      for (;;) {
-        const myIdx = idx++;
-        if (myIdx >= pending.length || this.stopRequested) return;
-        const row = pending[myIdx];
-        const url = this.buildUrl(`/core/${row.core_id}`);
-
-        let job = inFlight.get(url);
-        if (!job) {
-          job = this.fetchAndVerify(url, row.core_id);
-          inFlight.set(url, job);
-          try {
-            await job;
-          } finally {
-            inFlight.delete(url);
-          }
-        } else {
-          // 同一详情地址已有在途请求：等待其完成后再依据各自修订复查
-          await job.catch(() => undefined);
-          await this.evaluateOne(row);
-        }
-      }
-    };
-
-    await Promise.all(Array.from({ length: workers }, () => worker()));
-  }
-
-  /** 拉取一次详情，并对该岩芯所有 PENDING 修订逐一判定。 */
-  private async fetchAndVerify(url: string, coreId: string): Promise<void> {
-    try {
-      const res = await this.fetcher.get(url);
-      const detail = parseDetail(res.body, coreId);
-      await this.db.recordUrl(url, "DETAIL", "DONE", null);
-      const byRevision = new Map(detail.history.map((h) => [h.revision, h]));
-      const pendingRows = (await this.db.listPending()).filter((r) => r.core_id === coreId);
-      for (const row of pendingRows) {
-        const match = byRevision.get(row.revision);
-        if (match) {
-          // 该修订已在详情页（含修订历史）生效 → 核实通过，立即可查
-          await this.db.markVerified(coreId, row.revision, match);
-          this.log(
-            `核实通过：${coreId} r${row.revision}（岩性 ${match.classification}，核实人 ${match.verifier}）`,
-          );
-        } else if (detail.currentRevision < row.revision) {
-          // 列表已公布更正、详情尚未生效 → 保持 PENDING，后续复查
-          await this.db.markStillStale(coreId, row.revision, detail.currentRevision);
-        } else {
-          // 当前修订号更大但历史中缺该条（异常数据）：记录并留待复查
-          await this.db.markStillStale(coreId, row.revision, detail.currentRevision);
-        }
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.db.recordUrl(url, "DETAIL", "FAILED", message).catch(() => undefined);
-      const pendingRows = (await this.db.listPending()).filter((r) => r.core_id === coreId);
-      for (const row of pendingRows) await this.db.recordAttempt(row.core_id, row.revision, message);
-      this.lastError = message;
-      this.log(`详情抓取失败 ${coreId}：${message}（将在后续轮次重试）`);
-    }
-  }
-
-  /** 复用在途详情响应后的二次复查入口（同一 URL 不重复发请求的场景之外兜底）。 */
-  private async evaluateOne(row: IdentificationRow): Promise<void> {
-    const fresh = await this.db.getIdentification(row.core_id, row.revision);
-    if (fresh && fresh.status === "PENDING") {
-      const url = this.buildUrl(`/core/${row.core_id}`);
-      await this.fetchAndVerify(url, row.core_id);
-    }
-  }
+  //
+  // 详情请求与调度完全交给 DetailScheduler：
+  //  - 同一详情地址的多个待核实修订共用一次复查（按 revision 各自判定）；
+  //  - 内存窗口 ≤64 个地址，退避/等待复查中的地址让出槽位；
+  //  - 所有请求仍经统一 HttpFetcher（站点限额 + Retry-After）。
 
   // ---------------- 增量 ----------------
 
@@ -367,14 +322,14 @@ export class Collector {
       // 重扫更正列表：全量期间发布的更正也会在这里登记并接上
       const { newestSeq } = await this.crawlCorrections(true);
 
-      // 复查全部待核实修订（含详情滞后遗留 + 新发布修订）
-      let pass = 0;
-      while (!this.stopRequested && pass < 3) {
-        pass += 1;
-        const pending = await this.db.listPending();
-        if (pending.length === 0) break;
-        this.log(`增量复查第 ${pass} 轮，待核实 ${pending.length} 条`);
-        await this.verifyPending(pending);
+      // 复查全部待核实修订（含详情滞后遗留 + 新发布修订）。
+      // 调度器只用空闲额度推进：积压再多也按固定窗口分批，退避中的地址不会抢额度。
+      const drained = await this.scheduler.drainPending({
+        timeoutMs: config.catchupDrainBudgetMs,
+        shouldStop: () => this.stopRequested,
+      });
+      if (!drained) {
+        this.log("增量复查未能在本次窗口内清零，剩余待核实修订留待下一轮（已安排的复查/退避时间保留）");
       }
 
       const contiguous = await this.recomputeContiguous(baseline);
@@ -421,9 +376,14 @@ export class Collector {
 
   // ---------------- 进度快照 ----------------
 
+  snapshotSchedule(coreId?: string) {
+    return this.scheduler.snapshotSchedule(coreId);
+  }
+
   async snapshot(): Promise<ProgressSnapshot> {
     const state = await this.db.getRunState();
     const counts = await this.db.countByStatus();
+    const schedule = await this.scheduler.stats();
     return {
       phase: this.phase,
       running: this.running,
@@ -446,6 +406,7 @@ export class Collector {
         verified: counts.verified,
         pending: counts.pending,
       },
+      schedule,
       contiguousVerifiedSeq: Number(state.last_contiguous_verified_seq),
       fullCompleted: state.full_completed,
       fullCompletedAt: state.full_completed_at,

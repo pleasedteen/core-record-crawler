@@ -23,22 +23,32 @@
 | 强制结束后续跑 | 全部断点与核实结果落 DuckDB；重启读取 `run_state` 继续，残留 `RUNNING` 标记为 `INTERRUPTED` |
 | 统一限流 / 在途上限 | 目录、列表、详情、重试请求共用一个 `HttpFetcher`：滑动窗口速率 + 信号量在途上限 |
 | Retry-After 全局等待 | 收到等待时间后设置全局 `pausedUntil`，后续所有请求统一等待 |
+| 积压上万条仍可控 | `DetailScheduler` 内存窗口硬上限 64 个详情地址（排队+执行+等待），积压按批从库中取 |
+| 退避中让出请求机会 | 等待复查/退避的地址在窗口满且仍有新地址时换出窗口（保留原时刻），空闲额度给其他地址 |
+| 追更不被积压饿死 | 新登记的修订按发布序号从新到旧优先入窗，全量积压期间也周期性重扫更正列表 |
+| 强杀重启仍遵守安排 | `detail_schedule` / `detail_deferred` 持久化每个地址的复查/退避时刻；重启后等到原时刻才请求 |
+| 同地址多修订共用复查 | 每个详情地址一行调度记录，一次响应按 `revision` 逐一判定该地址全部待核实修订 |
 
 ## 2. 目录结构
 
 ```
 src/
   config.ts            全部可调参数（环境变量覆盖）
-  db.ts                DuckDB 存储层：建表、断点状态、核实/查询
+  db.ts                DuckDB 存储层：建表、断点状态、详情调度表、核实/查询
   api.ts               本地 HTTP 查询与进度接口
   main.ts              入口（默认内嵌模拟站点 + 采集服务）
   collect/
     http.ts            统一 HTTP 客户端：限流、在途上限、退避重试、Retry-After
     parse.ts           目录/更正/详情解析
+    scheduler.ts       详情核实调度器：固定窗口(≤64) + 持久化复查/退避时刻
     collector.ts       全量 + 增量 + 断点续传编排
   mock/site.ts         离线模拟馆藏站点
   util/rng.ts          确定性随机工具
-scripts/verify.ts      离线端到端验证（含 SIGKILL 重启续跑）
+scripts/
+  verify.ts            离线端到端验证（含 SIGKILL 重启续跑）
+  verify-backlog.ts    积压场景验证（万级待核实 + 追更 + 强杀恢复的请求时序）
+  backlog-scenario-site.ts  积压场景专用离线站点
+  backlog-service.ts        积压场景专用服务（只跑调度器 + 查询接口）
 ```
 
 ## 3. 快速开始
@@ -68,6 +78,24 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 详情滞后→时钟推进→增量衔接、按编号查询与站点终态逐一比对。
 全部通过打印 `🎉 全部验证通过`，退出码 0。
 
+### 积压场景验证（万级待核实）
+
+```bash
+npm run verify:backlog
+```
+
+不依赖内嵌站点，自带场景站点与服务（只跑调度器 + 查询接口），约 10 秒：
+
+- 写入 11,600 个待核实详情地址 + 40 个详情滞后地址 + 6 个反复拒绝地址；
+- 断言调度窗口任何时刻 ≤64（驻留 = 排队 + 执行 + 等待）；
+- 积压未清空时，通过更正列表追更登记的新修订仍能被空闲额度核实；
+- 退避中的地址：自身在退避期内不再请求，其他地址持续被请求，到点才重试；
+- 站点 Retry-After 暂停期间不发出任何详情请求（全局限额共用）；
+- 同一地址的多个待核实修订共用一次复查；
+- 在退避期强杀进程 → 重启后仍等到原定退避时刻才请求，窗口恢复后仍 ≤64。
+
+全部通过打印 `🎉 积压场景验证通过`，退出码 0。
+
 ## 5. HTTP 接口说明
 
 基址 `http://127.0.0.1:8080`
@@ -78,7 +106,8 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 | GET | `/cores/:coreId` | 按岩芯编号查询**最新已核实鉴定**（无核实结果返回 404） |
 | GET | `/cores?limit=&offset=` | 已核实岩芯分页列表 |
 | GET | `/identifications/:coreId` | 该岩芯全部修订及各自核实状态 |
-| GET | `/progress` | 采集进度（阶段、目录/更正游标、核实计数、连续核实序号、HTTP 统计） |
+| GET | `/progress` | 采集进度（阶段、目录/更正游标、核实计数、连续核实序号、调度窗口、HTTP 统计） |
+| GET | `/schedule?coreId=` | 详情调度明细：窗口驻留地址、各地址的复查/退避时刻、换出窗口的延迟地址 |
 | GET | `/stats` | 汇总：URL 去重数与尝试次数、各状态运行计数 |
 | GET | `/runs` / `/runs/:id` | 运行历史（含 `INTERRUPTED`/`COMPLETED`/`FAILED`） |
 | POST | `/collect/run-full` | 手工触发全量 |
@@ -110,6 +139,7 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 - `phase`：`IDLE` / `FULL` / `INCREMENTAL`
 - `catalog` / `corrections`：分页游标与总页数（断点）
 - `details`：`total` / `verified` / `pending`
+- `schedule`：`resident`（窗口驻留，≤64）/ `queued` / `running` / `waiting` / `deferred`（换出窗口、仍按原时刻等待）/ `backlog`（尚未入窗）/ `pendingCores`
 - `contiguousVerifiedSeq`：从上次进度起**连续核实**到的最大发布序号（增量进度口径）
 - `fullCompleted`：全量是否完成
 - `http`：累计请求数、重试次数、Retry-After 等待次数
@@ -124,15 +154,24 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 | `DB_PATH` | ./data/archive.duckdb | DuckDB 数据文件 |
 | `RATE_MAX_REQUESTS` / `RATE_WINDOW_MS` | 14 / 1000 | 每窗口最大请求数 |
 | `MAX_INFLIGHT` | 6 | 全局在途请求上限 |
-| `MAX_RETRIES` / `RETRY_BASE_MS` / `RETRY_MAX_MS` | 8 / 250 / 8000 | 退避重试参数 |
+| `MAX_RETRIES` / `RETRY_BASE_MS` / `RETRY_MAX_MS` | 8 / 250 / 8000 | 退避重试参数（目录/列表请求） |
 | `REQUEST_TIMEOUT_MS` | 8000 | 单次请求超时 |
-| `CATCHUP_INTERVAL_MS` | 3000 | 增量追更周期 |
+| `SCHEDULER_WINDOW` | 64 | 详情调度内存窗口（硬上限 64，排队+执行+等待都算） |
+| `DETAIL_CONCURRENCY` | `MAX_INFLIGHT-2` | 详情请求并发（给目录/列表留额度） |
+| `SCHEDULER_TICK_MS` | 50 | 调度器巡检间隔 |
+| `SCHEDULER_EVICTION_BUDGET` | 8 | 每轮巡检最多让出窗口的等待地址数 |
+| `DETAIL_RECHECK_BASE_MS` / `DETAIL_RECHECK_MAX_MS` | 1000 / 8000 | 详情滞后时的复查间隔（按尝试次数指数增长） |
+| `DETAIL_BACKOFF_BASE_MS` / `DETAIL_BACKOFF_MAX_MS` | 250 / 8000 | 详情失败退避（与 Retry-After 取较大者） |
+| `CATCHUP_INTERVAL_MS` | 3000 | 增量追更周期（全量积压期间也用它重扫更正列表） |
+| `CATCHUP_DRAIN_BUDGET_MS` | 15000 | 单次增量最多占用多久推进详情 |
 | `AUTO_FULL` | true | 启动是否自动全量 |
 | `EMBED_MOCK` | 1 | 是否进程内嵌模拟站点 |
 
 ## 7. 存储模型（DuckDB）
 
 - `identifications`：每个 `(core_id, revision)` 一行，`PENDING`/`VERIFIED` 状态 + 核实内容 + 尝试次数
+- `detail_schedule`：详情调度窗口（≤64 行），每地址一行：`state`（QUEUED/RUNNING/WAITING）、`reason`（RECHECK/BACKOFF）、`attempts`、`next_attempt_at`
+- `detail_deferred`：因窗口已满被暂时换出的等待地址，保留原复查/退避时刻，到点自动回到窗口
 - `fetch_urls`：已抓取 URL（去重与尝试次数证据）
 - `runs`：每次全量/增量运行记录（含中断标记）
 - `run_state`：单行断点表（目录/更正游标、连续核实序号、全量完成标志）
