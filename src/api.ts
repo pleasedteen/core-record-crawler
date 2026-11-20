@@ -52,6 +52,7 @@ export function createApiServer(db: Database, collector: Collector): http.Server
         return json(res, 200, {
           coreId: row.core_id,
           revision: row.revision,
+          issue: row.issue,
           publishedSeq: Number(row.published_seq),
           publishedAt: row.published_at,
           verifiedIdentification: {
@@ -80,6 +81,7 @@ export function createApiServer(db: Database, collector: Collector): http.Server
           items: rows.map((row) => ({
             coreId: row.core_id,
             revision: row.revision,
+            issue: row.issue,
             publishedSeq: Number(row.published_seq),
             classification: row.classification,
             formation: row.formation,
@@ -102,7 +104,9 @@ export function createApiServer(db: Database, collector: Collector): http.Server
           coreId,
           revisions: rows.map((r) => ({
             revision: r.revision,
+            issue: r.issue,
             publishedSeq: Number(r.published_seq),
+            withdrawSeq: r.withdraw_seq === null ? null : Number(r.withdraw_seq),
             status: r.status,
             classification: r.classification,
             verifier: r.verifier,
@@ -130,6 +134,43 @@ export function createApiServer(db: Database, collector: Collector): http.Server
         });
       }
 
+      // 更正公告台账（撤回也占发布序号；原发布与撤回都计入已处置）
+      if (p === "/announcements" && req.method === "GET") {
+        const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit") ?? "200")));
+        const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0"));
+        const rows = await db.all<{
+          published_seq: number;
+          kind: string;
+          core_id: string;
+          revision: number;
+          issue: number | null;
+          withdrawn_issue: number | null;
+          published_at: string;
+          note: string | null;
+        }>(
+          `SELECT * FROM announcements ORDER BY published_seq LIMIT ? OFFSET ?`,
+          [limit, offset],
+        );
+        const counts = await db.countAnnouncements();
+        return json(res, 200, {
+          total: counts.total,
+          publishes: counts.publishes,
+          withdraws: counts.withdraws,
+          limit,
+          offset,
+          items: rows.map((r) => ({
+            publishedSeq: Number(r.published_seq),
+            kind: r.kind,
+            coreId: r.core_id,
+            revision: Number(r.revision),
+            issue: r.issue === null ? null : Number(r.issue),
+            withdrawnIssue: r.withdrawn_issue === null ? null : Number(r.withdrawn_issue),
+            publishedAt: r.published_at,
+            note: r.note,
+          })),
+        });
+      }
+
       // 运行历史
       if (p === "/runs" && req.method === "GET") {
         return json(res, 200, { runs: await db.listRuns(30) });
@@ -152,12 +193,15 @@ export function createApiServer(db: Database, collector: Collector): http.Server
           `SELECT status, CAST(COUNT(*) AS INTEGER) AS n FROM runs GROUP BY status ORDER BY status`,
         );
         const counts = await db.countByStatus();
+        const announcements = await db.countAnnouncements();
         return json(res, 200, {
           identifications: {
-            total: counts.verified + counts.pending,
+            total: counts.verified + counts.pending + counts.withdrawn,
             verified: counts.verified,
             pending: counts.pending,
+            withdrawn: counts.withdrawn,
           },
+          announcements,
           fetchUrls: urlKinds.map((r) => ({
             kind: r.kind,
             distinctUrls: Number(r.n),
@@ -190,6 +234,7 @@ export function createApiServer(db: Database, collector: Collector): http.Server
           "GET /cores/:coreId",
           "GET /cores?limit=&offset=",
           "GET /identifications/:coreId",
+          "GET /announcements",
           "GET /progress",
           "GET /runs",
           "GET /runs/:id",

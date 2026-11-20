@@ -2,14 +2,15 @@
  * 采集编排器。
  *
  * 流程：
- *  全量：分页抓取目录（重复链接去重合并）→ 按发布顺序抓更正列表（登记全部修订）
- *        → 并发拉详情核实待核实修订（详情仍旧修订则保留 PENDING 等待复查）
- *        → 全部核实后全量完成；之后周期性增量追更正。
- *  增量：重扫更正列表发现新修订 → 复查所有 PENDING（含上次遗留的详情滞后修订）
- *        → 只把“从上次进度开始连续核实”的发布范围计入增量进度。
+ *  全量：分页抓取目录（重复链接去重合并）→ 按发布顺序抓更正列表（登记全部公告，
+ *        PUBLISH/WITHDRAW 各占一个发布序号）→ 并发拉详情核实待核实修订
+ *        （详情仍旧修订则保留 PENDING 等待复查；撤回的修订不再核实）
+ *        → 全部公告处置完毕（VERIFIED 或 WITHDRAWN）后全量完成；之后周期性增量追更正。
+ *  增量：重扫更正列表发现新公告（含撤回公告与同号重发）→ 复查所有 PENDING
+ *        （含上次遗留的详情滞后修订）→ 连续进度遇到未处置序号（含撤回缺口）即停止。
  *
  * 所有进度状态写入 DuckDB；进程被强制结束后重启，依据库内状态继续，
- * 已保存的核实结果原样沿用。
+ * 已保存的核实/撤回结果原样沿用。
  */
 import { config } from "../config.js";
 import { Database, IdentificationRow } from "../db.js";
@@ -35,8 +36,16 @@ export interface ProgressSnapshot {
     total: number;
     verified: number;
     pending: number;
+    withdrawn: number;
   };
-  /** 从上次进度开始连续核实到的最大发布序号（增量进度口径）。 */
+  /** 更正公告台账：发布数、撤回数、已处置序号数（原发布与撤回都计入）。 */
+  announcements: {
+    total: number;
+    publishes: number;
+    withdraws: number;
+    disposed: number;
+  };
+  /** 从上次进度开始连续推进到的最大发布序号（撤回占号但不在撤回处推进）。 */
   contiguousVerifiedSeq: number;
   fullCompleted: boolean;
   fullCompletedAt: string | null;
@@ -71,7 +80,7 @@ export class Collector {
     );
     const state = await this.db.getRunState();
     if (state.full_completed) {
-      this.log(`检测到全量已完成（连续核实序号 ${state.last_contiguous_verified_seq}），进入增量模式`);
+      this.log(`检测到全量已完成（连续进度序号 ${state.last_contiguous_verified_seq}），进入增量模式`);
       this.scheduleCatchup(200);
       return;
     }
@@ -97,6 +106,12 @@ export class Collector {
     return `${this.baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
   }
 
+  /** 所有已发布公告是否均已处置：撤回公告天然已处置，发布须 VERIFIED 或 WITHDRAWN。 */
+  private async allDisposed(): Promise<boolean> {
+    const rows = await this.db.listEventDispositions();
+    return rows.every((r) => r.kind === "WITHDRAW" || r.status === "VERIFIED" || r.status === "WITHDRAWN");
+  }
+
   // ---------------- 全量 ----------------
 
   async runFullForever(): Promise<void> {
@@ -110,17 +125,19 @@ export class Collector {
 
       await this.crawlCatalog();
       await this.crawlCorrections();
-      // 详情可能滞后：多轮复查直到全部核实（每轮之间站点时钟会推进或重试退避）
+      // 详情可能滞后：多轮复查直到全部公告处置完毕（每轮之间站点时钟会推进或重试退避）
       let pass = 0;
       while (!this.stopRequested) {
         pass += 1;
         const pendingBefore = await this.db.listPending();
-        if (pendingBefore.length === 0) break;
-        this.log(`详情核实第 ${pass} 轮，待核实 ${pendingBefore.length} 条`);
-        await this.verifyPending(pendingBefore);
+        if (pendingBefore.length === 0 && (await this.allDisposed())) break;
+        if (pendingBefore.length > 0) {
+          this.log(`详情核实第 ${pass} 轮，待核实 ${pendingBefore.length} 条`);
+          await this.verifyPending(pendingBefore);
+        }
         const still = await this.db.listPending();
-        if (still.length === 0) break;
-        this.log(`仍有 ${still.length} 条详情滞后，等待站点详情更新后复查`);
+        if (still.length === 0 && (await this.allDisposed())) break;
+        this.log(`仍有 ${still.length} 条详情滞后或公告未处置，等待站点详情更新后复查`);
         await sleep(500);
       }
 
@@ -131,14 +148,13 @@ export class Collector {
       }
 
       const contiguous = await this.recomputeContiguous(0);
-      const state = await this.db.getRunState();
       await this.db.saveRunState({
         full_completed: true,
         full_completed_at: new Date().toISOString(),
         last_contiguous_verified_seq: contiguous,
       });
       await this.db.finishRun(this.runId!, "COMPLETED", null);
-      this.log(`全量采集完成：共 ${state.last_contiguous_verified_seq || contiguous} 个发布序号已连续核实`);
+      this.log(`全量采集完成：连续进度推进至发布序号 ${contiguous}（撤回占号，缺口前停止）`);
       this.scheduleCatchup(config.catchupIntervalMs);
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
@@ -194,10 +210,11 @@ export class Collector {
   }
 
   private async registerCatalogLink(link: CatalogLink): Promise<void> {
-    // 目录先发现时发布序号未知（0），待更正列表公布后回填
+    // 目录先发现时发布序号未知（0），待更正列表公布后回填；目录不区分发布批次，按 issue=1 登记
     await this.db.upsertPublishedRevision({
       coreId: link.coreId,
       revision: link.revision,
+      issue: 1,
       publishedSeq: 0,
       publishedAt: link.updatedAt || new Date(0).toISOString(),
       detailReadySeq: null,
@@ -210,7 +227,7 @@ export class Collector {
    * 抓取更正列表。
    * @param rescan false（全量）：从持久化游标续跑，进程被杀后不重复翻页；
    *               true（增量/重扫）：从第 1 页开始全量重扫，upsert 幂等去重，
-   *               这样全量期间发布的更正也一定能被后续增量接上，且能适应页数增长。
+   *               这样全量期间发布的更正/撤回也一定能被后续增量接上，且能适应页数增长。
    */
   private async crawlCorrections(
     rescan = false,
@@ -225,7 +242,8 @@ export class Collector {
       const res = await this.fetcher.get(url);
       const parsed = parseCorrections(res.body);
       totalPages = parsed.totalPages;
-      this.totalPublished = parsed.totalPublished;
+      // 重扫时页数可能增长（运行时撤回/重发会追加公告），取各页口径的最大值
+      this.totalPublished = Math.max(this.totalPublished ?? 0, parsed.totalPublished);
 
       for (const item of parsed.items) await this.registerCorrection(item);
       const maxSeq = parsed.items.reduce((m, it) => Math.max(m, it.publishedSeq), newestSeq);
@@ -247,15 +265,48 @@ export class Collector {
   }
 
   private async registerCorrection(item: CorrectionItem): Promise<void> {
+    // 公告先入库：PUBLISH 与 WITHDRAW 都占发布序号，重扫幂等
+    await this.db.recordAnnouncement({
+      kind: item.kind,
+      publishedSeq: item.publishedSeq,
+      coreId: item.coreId,
+      revision: item.revision,
+      issue: item.issue,
+      withdrawnIssue: item.withdrawnIssue,
+      publishedAt: item.publishedAt,
+      note: item.note,
+    });
+
+    if (item.kind === "WITHDRAW") {
+      const issue = item.withdrawnIssue ?? 1;
+      const outcome = await this.db.markWithdrawn({
+        coreId: item.coreId,
+        revision: item.revision,
+        issue,
+        withdrawSeq: item.publishedSeq,
+      });
+      this.log(
+        `撤回公告入库（序号 ${item.publishedSeq}）：${item.coreId} r${item.revision}#${issue}` +
+          `${outcome === "missing" ? "（原发布尚未登记，后续重扫补齐状态）" : " 已标记 WITHDRAWN"}`,
+      );
+      return;
+    }
+
+    // PUBLISH（含撤回后沿用原修订号重发，issue 区分批次）
+    const issue = item.issue ?? 1;
     const result = await this.db.upsertPublishedRevision({
       coreId: item.coreId,
       revision: item.revision,
+      issue,
       publishedSeq: item.publishedSeq,
       publishedAt: item.publishedAt,
       detailReadySeq: null,
     });
     if (result === "inserted") {
-      this.log(`发现新发布修订：${item.coreId} r${item.revision}（发布序号 ${item.publishedSeq}，${item.note}）`);
+      this.log(
+        `发现新发布：${item.coreId} r${item.revision}#${issue}` +
+          `（发布序号 ${item.publishedSeq}${issue > 1 ? "，同号重发" : ""}）`,
+      );
     }
   }
 
@@ -264,7 +315,7 @@ export class Collector {
   /**
    * 并发核实待核实修订。
    * 同一详情地址的多个待核实修订共享同一次响应：
-   * 同一待核实修订只合并采集一次，后续修订仍会触发复查（按 revision 各自判定）。
+   * 同一待核实修订只合并采集一次，后续修订/重发仍会触发复查（按 revision+issue 各自判定）。
    */
   private async verifyPending(pending: IdentificationRow[]): Promise<void> {
     const inFlight = new Map<string, Promise<void>>();
@@ -288,7 +339,7 @@ export class Collector {
             inFlight.delete(url);
           }
         } else {
-          // 同一详情地址已有在途请求：等待其完成后再依据各自修订复查
+          // 同一详情地址已有在途请求：等待其完成后再依据各自修订/批次复查
           await job.catch(() => undefined);
           await this.evaluateOne(row);
         }
@@ -298,35 +349,42 @@ export class Collector {
     await Promise.all(Array.from({ length: workers }, () => worker()));
   }
 
-  /** 拉取一次详情，并对该岩芯所有 PENDING 修订逐一判定。 */
+  /** 拉取一次详情，并对该岩芯所有 PENDING 修订逐一判定（按 revision+issue 匹配）。 */
   private async fetchAndVerify(url: string, coreId: string): Promise<void> {
     try {
       const res = await this.fetcher.get(url);
       const detail = parseDetail(res.body, coreId);
       await this.db.recordUrl(url, "DETAIL", "DONE", null);
-      const byRevision = new Map(detail.history.map((h) => [h.revision, h]));
+      const keyOf = (revision: number, issue: number) => `${revision}#${issue}`;
+      const byKey = new Map(detail.history.map((h) => [keyOf(h.revision, h.issue), h]));
       const pendingRows = (await this.db.listPending()).filter((r) => r.core_id === coreId);
       for (const row of pendingRows) {
-        const match = byRevision.get(row.revision);
+        const match = byKey.get(keyOf(row.revision, row.issue));
         if (match) {
-          // 该修订已在详情页（含修订历史）生效 → 核实通过，立即可查
-          await this.db.markVerified(coreId, row.revision, match);
+          // 该批次已在详情页（含修订历史）生效 → 核实通过，立即可查
+          await this.db.markVerified(coreId, row.revision, row.issue, match);
           this.log(
-            `核实通过：${coreId} r${row.revision}（岩性 ${match.classification}，核实人 ${match.verifier}）`,
+            `核实通过：${coreId} r${row.revision}#${row.issue}（岩性 ${match.classification}，核实人 ${match.verifier}）`,
           );
-        } else if (detail.currentRevision < row.revision) {
-          // 列表已公布更正、详情尚未生效 → 保持 PENDING，后续复查
-          await this.db.markStillStale(coreId, row.revision, detail.currentRevision);
         } else {
-          // 当前修订号更大但历史中缺该条（异常数据）：记录并留待复查
-          await this.db.markStillStale(coreId, row.revision, detail.currentRevision);
+          // 列表已公布（或同号重发已公布）、详情尚未生效 → 保持 PENDING，后续复查。
+          // 旧详情仍展示期间不切换，等本次发布在详情页核实后才切换。
+          await this.db.markStillStale(
+            coreId,
+            row.revision,
+            row.issue,
+            detail.currentRevision,
+            detail.currentIssue,
+          );
         }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await this.db.recordUrl(url, "DETAIL", "FAILED", message).catch(() => undefined);
       const pendingRows = (await this.db.listPending()).filter((r) => r.core_id === coreId);
-      for (const row of pendingRows) await this.db.recordAttempt(row.core_id, row.revision, message);
+      for (const row of pendingRows) {
+        await this.db.recordAttempt(row.core_id, row.revision, row.issue, message);
+      }
       this.lastError = message;
       this.log(`详情抓取失败 ${coreId}：${message}（将在后续轮次重试）`);
     }
@@ -334,7 +392,7 @@ export class Collector {
 
   /** 复用在途详情响应后的二次复查入口（同一 URL 不重复发请求的场景之外兜底）。 */
   private async evaluateOne(row: IdentificationRow): Promise<void> {
-    const fresh = await this.db.getIdentification(row.core_id, row.revision);
+    const fresh = await this.db.getIdentification(row.core_id, row.revision, row.issue);
     if (fresh && fresh.status === "PENDING") {
       const url = this.buildUrl(`/core/${row.core_id}`);
       await this.fetchAndVerify(url, row.core_id);
@@ -362,12 +420,12 @@ export class Collector {
     try {
       const before = await this.db.getRunState();
       const baseline = before.last_contiguous_verified_seq;
-      this.log(`增量追更正开始（上次连续核实序号 ${baseline}）`);
+      this.log(`增量追更正开始（上次连续进度序号 ${baseline}）`);
 
-      // 重扫更正列表：全量期间发布的更正也会在这里登记并接上
+      // 重扫更正列表：全量期间发布的更正/撤回也会在这里登记并接上
       const { newestSeq } = await this.crawlCorrections(true);
 
-      // 复查全部待核实修订（含详情滞后遗留 + 新发布修订）
+      // 复查全部待核实修订（含详情滞后遗留 + 新发布/同号重发）
       let pass = 0;
       while (!this.stopRequested && pass < 3) {
         pass += 1;
@@ -383,9 +441,10 @@ export class Collector {
         last_catchup_at: new Date().toISOString(),
       });
       await this.db.finishRun(runId, "COMPLETED", null);
+      const counts = await this.db.countByStatus();
       this.log(
-        `增量完成：本次新连续核实范围 (${baseline} → ${contiguous}]，` +
-          `站点已发布至 ${newestSeq}，待核实 ${(await this.db.countByStatus()).pending} 条`,
+        `增量完成：连续进度 (${baseline} → ${contiguous}]，` +
+          `站点已发布至 ${newestSeq}，待核实 ${counts.pending} 条，已撤回 ${counts.withdrawn} 条`,
       );
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
@@ -400,20 +459,25 @@ export class Collector {
   }
 
   /**
-   * 计算从 baseline 开始连续核实到的最大发布序号。
-   * 只计入序号连续且对应修订全部 VERIFIED 的范围；遇到缺口即停止。
+   * 计算从 baseline 开始连续推进到的最大发布序号。
+   * 每个序号都必须已处置：WITHDRAW 公告天然已处置；PUBLISH 对应行须 VERIFIED/WITHDRAWN。
+   * 撤回公告占用序号，但若其本身落在缺口处，连续进度不会在撤回处推进——仍停在缺口前。
+   * 序号只许前进不许回退（撤回不回拨连续进度）。
    */
   private async recomputeContiguous(baseline: number): Promise<number> {
-    const rows = await this.db.all<{ published_seq: number; status: string }>(
-      `SELECT published_seq, status FROM identifications
-        WHERE published_seq > 0
-        ORDER BY published_seq`,
+    const rows = await this.db.listEventDispositions();
+    const disposed = new Set(
+      rows
+        .filter(
+          (r) =>
+            r.kind === "WITHDRAW" || r.status === "VERIFIED" || r.status === "WITHDRAWN",
+        )
+        .map((r) => Number(r.published_seq)),
     );
-    const verifiedSeqs = new Set(rows.filter((r) => r.status === "VERIFIED").map((r) => Number(r.published_seq)));
     let cursor = baseline;
     for (;;) {
       const next = cursor + 1;
-      if (verifiedSeqs.has(next)) cursor = next;
+      if (disposed.has(next)) cursor = next;
       else break;
     }
     return cursor;
@@ -424,6 +488,11 @@ export class Collector {
   async snapshot(): Promise<ProgressSnapshot> {
     const state = await this.db.getRunState();
     const counts = await this.db.countByStatus();
+    const announcements = await this.db.countAnnouncements();
+    const dispositions = await this.db.listEventDispositions();
+    const disposed = dispositions.filter(
+      (r) => r.kind === "WITHDRAW" || r.status === "VERIFIED" || r.status === "WITHDRAWN",
+    ).length;
     return {
       phase: this.phase,
       running: this.running,
@@ -439,12 +508,20 @@ export class Collector {
         cursor: Number(state.correction_page_cursor),
         totalPages:
           state.correction_total_pages === null ? null : Number(state.correction_total_pages),
-        totalPublished: this.totalPublished,
+        // 以公告台账为持久化口径：运行时撤回/重发追加公告后，重启也能拿到真实已发布总数
+        totalPublished: announcements.total > 0 ? announcements.total : this.totalPublished,
       },
       details: {
-        total: counts.verified + counts.pending,
+        total: counts.verified + counts.pending + counts.withdrawn,
         verified: counts.verified,
         pending: counts.pending,
+        withdrawn: counts.withdrawn,
+      },
+      announcements: {
+        total: announcements.total,
+        publishes: announcements.publishes,
+        withdraws: announcements.withdraws,
+        disposed,
       },
       contiguousVerifiedSeq: Number(state.last_contiguous_verified_seq),
       fullCompleted: state.full_completed,
