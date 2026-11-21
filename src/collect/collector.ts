@@ -2,10 +2,13 @@
  * 采集编排器。
  *
  * 流程：
- *  全量：分页抓取目录（重复链接去重合并）→ 按发布顺序抓更正列表（登记全部修订）
- *        → 并发拉详情核实待核实修订（详情仍旧修订则保留 PENDING 等待复查）
- *        → 全部核实后全量完成；之后周期性增量追更正。
- *  增量：重扫更正列表发现新修订 → 复查所有 PENDING（含上次遗留的详情滞后修订）
+ *  全量：分页抓取目录（重复链接去重合并）→ 按发布顺序抓更正列表，
+ *        但只覆盖「启动时已发布的范围」（首次抓第 1 页时快照 totalPublished 落库，
+ *        强杀重启后沿用同一范围，不随站点后续公布扩大）→ 对待核实修订核实一轮：
+ *        详情已生效的立即核实可查，仍旧修订的保留 PENDING——【不等待详情生效】，
+ *        全量就此完成并交接给周期增量。
+ *  增量：周期性从第 1 页重扫更正列表 → 全量期间及之后新公布的更正
+ *        （即使追加到原来的末页）都被登记接上 → 复查所有 PENDING（含详情滞后遗留）
  *        → 只把“从上次进度开始连续核实”的发布范围计入增量进度。
  *
  * 所有进度状态写入 DuckDB；进程被强制结束后重启，依据库内状态继续，
@@ -13,7 +16,7 @@
  */
 import { config } from "../config.js";
 import { Database, IdentificationRow } from "../db.js";
-import { HttpFetcher } from "./http.js";
+import { HttpFetcher, HttpError } from "./http.js";
 import { parseCatalog, parseCorrections, parseDetail, CatalogLink, CorrectionItem } from "./parse.js";
 import { sleep } from "../util/rng.js";
 
@@ -35,7 +38,11 @@ export interface ProgressSnapshot {
     total: number;
     verified: number;
     pending: number;
+    /** 已核实但发布序号在连续核实进度之外（连续进度等前面缺口补齐）。 */
+    verifiedBeyondContiguous: number;
   };
+  /** 全量锁定的“启动时已发布”最大序号（断点落库，重启沿用）。 */
+  fullTargetSeq: number | null;
   /** 从上次进度开始连续核实到的最大发布序号（增量进度口径）。 */
   contiguousVerifiedSeq: number;
   fullCompleted: boolean;
@@ -106,22 +113,17 @@ export class Collector {
       this.runId = await this.db.startRun("FULL");
       this.phase = "FULL";
       this.lastError = null;
-      this.log(`全量采集开始（run #${this.runId}，支持中断后重启续跑）`);
+      this.log(`全量采集开始（run #${this.runId}）：只覆盖启动时已发布范围，滞后详情交周期增量`);
 
       await this.crawlCatalog();
       await this.crawlCorrections();
-      // 详情可能滞后：多轮复查直到全部核实（每轮之间站点时钟会推进或重试退避）
-      let pass = 0;
-      while (!this.stopRequested) {
-        pass += 1;
-        const pendingBefore = await this.db.listPending();
-        if (pendingBefore.length === 0) break;
-        this.log(`详情核实第 ${pass} 轮，待核实 ${pendingBefore.length} 条`);
-        await this.verifyPending(pendingBefore);
-        const still = await this.db.listPending();
-        if (still.length === 0) break;
-        this.log(`仍有 ${still.length} 条详情滞后，等待站点详情更新后复查`);
-        await sleep(500);
+      // 对待核实修订核实一轮：详情已生效的立即核实可查；仍旧修订的保留 PENDING。
+      // 不在此等待站点详情生效——全量只交接当前一轮结果，
+      // 滞后生效的详情与全量期间新公布的更正都由周期增量接上。
+      const pending = await this.db.listPending();
+      if (pending.length > 0) {
+        this.log(`详情核实一轮：待核实 ${pending.length} 条（滞后生效的不再原地等待）`);
+        await this.verifyPending(pending);
       }
 
       if (this.stopRequested) {
@@ -131,14 +133,17 @@ export class Collector {
       }
 
       const contiguous = await this.recomputeContiguous(0);
-      const state = await this.db.getRunState();
+      const left = await this.db.countByStatus();
       await this.db.saveRunState({
         full_completed: true,
         full_completed_at: new Date().toISOString(),
         last_contiguous_verified_seq: contiguous,
       });
       await this.db.finishRun(this.runId!, "COMPLETED", null);
-      this.log(`全量采集完成：共 ${state.last_contiguous_verified_seq || contiguous} 个发布序号已连续核实`);
+      this.log(
+        `全量采集完成：连续核实至序号 ${contiguous}，` +
+          `剩余待核实 ${left.pending} 条（详情滞后或后公布）交由周期增量复查`,
+      );
       this.scheduleCatchup(config.catchupIntervalMs);
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
@@ -163,13 +168,23 @@ export class Collector {
     let dupCount = 0;
 
     while (!this.stopRequested) {
+      if (totalPages !== null && page > totalPages) break; // 断点续跑：已知页抓完即停
       const url = this.buildUrl(`/catalog?page=${page}`);
       if (await this.db.hasFetchedUrl(url)) {
         page += 1;
-        if (totalPages !== null && page > totalPages) break;
         continue;
       }
-      const res = await this.fetcher.get(url);
+      let res;
+      try {
+        res = await this.fetcher.get(url);
+      } catch (err) {
+        // 站点目录尚未公布到该页（内嵌站点重启后会重新分批公布）：视为目录结束
+        if (err instanceof HttpError && err.status === 404) {
+          this.log(`目录第 ${page} 页暂未公布，结束目录翻页`);
+          break;
+        }
+        throw err;
+      }
       const parsed = parseCatalog(res.body, page);
       totalPages = parsed.totalPages;
 
@@ -188,7 +203,6 @@ export class Collector {
       });
       this.log(`目录第 ${page}/${totalPages} 页完成（本页链接 ${parsed.links.length} 条，累计重复合并 ${dupCount} 条）`);
       page += 1;
-      if (page > totalPages) break;
     }
     this.log(`目录抓取完成：去重后详情链接 ${seen.size} 个，重复链接合并 ${dupCount} 条`);
   }
@@ -208,28 +222,56 @@ export class Collector {
 
   /**
    * 抓取更正列表。
-   * @param rescan false（全量）：从持久化游标续跑，进程被杀后不重复翻页；
+   * @param rescan false（全量）：只覆盖「启动时已发布的范围」——首次抓第 1 页时
+   *               快照 totalPublished 存入 run_state.full_target_seq，强杀重启后沿用
+   *               同一范围；范围之外新公布的更正（即使追加到原来的末页）不在此登记，
+   *               留给周期增量接上；
    *               true（增量/重扫）：从第 1 页开始全量重扫，upsert 幂等去重，
-   *               这样全量期间发布的更正也一定能被后续增量接上，且能适应页数增长。
+   *               接住全部后公布的修订，且能适应页数增长。
    */
   private async crawlCorrections(
     rescan = false,
   ): Promise<{ newestSeq: number; totalPages: number | null }> {
     const state = await this.db.getRunState();
+    let target = rescan ? null : state.full_target_seq;
     let page = rescan ? 1 : state.correction_page_cursor + 1;
     let totalPages = rescan ? null : state.correction_total_pages;
-    let newestSeq = state.last_contiguous_verified_seq;
+    let newestSeq = rescan
+      ? state.last_contiguous_verified_seq
+      : await this.db.maxRegisteredSeq();
 
     while (!this.stopRequested) {
+      if (!rescan && target !== null && newestSeq >= target) break; // 启动范围已覆盖
+      if (totalPages !== null && page > totalPages) break;
       const url = this.buildUrl(`/corrections?page=${page}`);
-      const res = await this.fetcher.get(url);
+      let res;
+      try {
+        res = await this.fetcher.get(url);
+      } catch (err) {
+        // 列表尚未公布到该页（内嵌站点重启后重新分批公布）：结束翻页，交给增量
+        if (err instanceof HttpError && err.status === 404) {
+          this.log(`更正列表第 ${page} 页暂未公布，结束翻页`);
+          break;
+        }
+        throw err;
+      }
       const parsed = parseCorrections(res.body);
       totalPages = parsed.totalPages;
       this.totalPublished = parsed.totalPublished;
 
-      for (const item of parsed.items) await this.registerCorrection(item);
-      const maxSeq = parsed.items.reduce((m, it) => Math.max(m, it.publishedSeq), newestSeq);
-      newestSeq = maxSeq;
+      if (!rescan && target === null) {
+        // 快照「启动时已发布的范围」并落库：之后站点再公布也不扩大本次全量
+        target = parsed.totalPublished;
+        await this.db.saveRunState({ full_target_seq: target });
+        this.log(`全量范围快照：启动时已发布序号 ≤ ${target}，之后公布的更正交由周期增量接上`);
+      }
+
+      for (const item of parsed.items) {
+        if (!rescan && target !== null && item.publishedSeq > target) continue; // 超出启动范围，留给增量
+        await this.registerCorrection(item);
+      }
+      const pageMax = parsed.items.reduce((m, it) => Math.max(m, it.publishedSeq), 0);
+      newestSeq = Math.max(newestSeq, pageMax);
 
       await this.db.recordUrl(url, "CORRECTIONS", "DONE", null);
       await this.db.saveRunState({
@@ -238,10 +280,9 @@ export class Collector {
       });
       this.log(
         `${rescan ? "重扫" : "全量"}更正列表第 ${page}/${totalPages} 页完成` +
-          `（本页 ${parsed.items.length} 条，已发布总数 ${parsed.totalPublished}）`,
+          `（本页 ${parsed.items.length} 条，站点已发布 ${parsed.totalPublished} 条）`,
       );
       page += 1;
-      if (page > totalPages) break;
     }
     return { newestSeq, totalPages };
   }
@@ -424,6 +465,7 @@ export class Collector {
   async snapshot(): Promise<ProgressSnapshot> {
     const state = await this.db.getRunState();
     const counts = await this.db.countByStatus();
+    const contiguous = Number(state.last_contiguous_verified_seq);
     return {
       phase: this.phase,
       running: this.running,
@@ -445,8 +487,10 @@ export class Collector {
         total: counts.verified + counts.pending,
         verified: counts.verified,
         pending: counts.pending,
+        verifiedBeyondContiguous: await this.db.countVerifiedBeyondContiguous(contiguous),
       },
-      contiguousVerifiedSeq: Number(state.last_contiguous_verified_seq),
+      fullTargetSeq: state.full_target_seq === null ? null : Number(state.full_target_seq),
+      contiguousVerifiedSeq: contiguous,
       fullCompleted: state.full_completed,
       fullCompletedAt: state.full_completed_at,
       lastCatchupAt: state.last_catchup_at,

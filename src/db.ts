@@ -41,6 +41,8 @@ export interface RunStateRow {
   catalog_total_pages: number | null;
   correction_page_cursor: number;
   correction_total_pages: number | null;
+  /** 全量锁定的“启动时已发布”最大序号；快照后落库，强杀重启后沿用，不随站点后续公布扩大 */
+  full_target_seq: number | null;
   last_contiguous_verified_seq: number;
   full_completed: boolean;
   full_completed_at: string | null;
@@ -133,12 +135,16 @@ CREATE TABLE IF NOT EXISTS run_state (
   catalog_total_pages           INTEGER,
   correction_page_cursor        INTEGER NOT NULL DEFAULT 0,
   correction_total_pages        INTEGER,
+  full_target_seq               INTEGER,
   last_contiguous_verified_seq  INTEGER NOT NULL DEFAULT 0,
   full_completed                BOOLEAN NOT NULL DEFAULT false,
   full_completed_at             TIMESTAMP,
   last_catchup_at               TIMESTAMP,
   updated_at                    TIMESTAMP NOT NULL
 );
+
+-- 兼容旧库：补充全量目标序号快照列
+ALTER TABLE run_state ADD COLUMN IF NOT EXISTS full_target_seq INTEGER;
 `;
 
 export class Database {
@@ -336,6 +342,24 @@ export class Database {
     return { verified: Number(row?.verified ?? 0), pending: Number(row?.pending ?? 0) };
   }
 
+  /** 已登记修订的最大发布序号（全量判断“启动范围是否已覆盖”用）。 */
+  async maxRegisteredSeq(): Promise<number> {
+    const row = await this.one<{ n: number }>(
+      `SELECT CAST(COALESCE(MAX(published_seq), 0) AS INTEGER) AS n FROM identifications`,
+    );
+    return Number(row?.n ?? 0);
+  }
+
+  /** 已核实但发布序号在连续核实进度之外的修订数（连续进度等前面缺口补齐）。 */
+  async countVerifiedBeyondContiguous(contiguousSeq: number): Promise<number> {
+    const row = await this.one<{ n: number }>(
+      `SELECT CAST(COUNT(*) AS INTEGER) AS n FROM identifications
+        WHERE status = 'VERIFIED' AND published_seq > ?`,
+      [contiguousSeq],
+    );
+    return Number(row?.n ?? 0);
+  }
+
   async getLatestVerified(coreId: string): Promise<IdentificationRow | null> {
     return this.one<IdentificationRow>(
       `SELECT * FROM identifications
@@ -403,7 +427,7 @@ export class Database {
     await this.exec(
       `UPDATE run_state SET
          active_run_id = ?, mode = ?, catalog_page_cursor = ?, catalog_total_pages = ?,
-         correction_page_cursor = ?, correction_total_pages = ?,
+         correction_page_cursor = ?, correction_total_pages = ?, full_target_seq = ?,
          last_contiguous_verified_seq = ?, full_completed = ?, full_completed_at = ?,
          last_catchup_at = ?, updated_at = ?
        WHERE id = 1`,
@@ -414,6 +438,7 @@ export class Database {
         merged.catalog_total_pages,
         merged.correction_page_cursor,
         merged.correction_total_pages,
+        merged.full_target_seq,
         merged.last_contiguous_verified_seq,
         merged.full_completed,
         merged.full_completed_at,

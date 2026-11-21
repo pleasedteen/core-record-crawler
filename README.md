@@ -12,15 +12,19 @@
 | 按发布顺序翻页的 JSON 更正列表 | `GET /corrections?page=N`，含全局发布序号 `publishedSeq` |
 | 岩芯详情页 | `GET /core/:id`，同一岩芯多个修订共用同一地址，含「当前生效修订 + 修订历史」 |
 | 当年鉴定当天更正 | 数据集内含相同日期、不同 revision 的修订 |
-| 列表已更正、详情暂时仍旧修订 | 站点「详情生效时钟」控制，列表先公布、详情滞后生效；采集端保留 `PENDING` 并复查 |
+| 站点自行分批公布更正 | 内嵌站点按自身时钟逐批公布（无需外部推进），后公布的修订可能追加到原来的末页 |
+| 列表已更正、详情暂时仍旧修订 | 站点「详情生效时钟」滞后于公布进度并自行推进；采集端保留 `PENDING` 并复查 |
+| 全量只等待启动时已发布的范围 | 首次抓更正列表时快照 `totalPublished` 存入 `run_state.full_target_seq`，只覆盖该范围 |
+| 全量不等待详情 | 全量对待核实修订只核实一轮，滞后生效的保留 `PENDING`，直接交接给周期增量 |
 | 重复链接 | 目录刻意输出重复 `<li>`，采集端按详情 URL 去重合并 |
 | 临时拒绝 | 站点随机返回 503（带 `Retry-After`）与 500；采集端指数退避重试 |
 | 同一待核实修订只合并采集一次 | `identifications` 以 `(core_id, revision)` 为主键；同 URL 在途请求共享响应 |
 | 后续修订触发复查 | 每个 revision 独立判定，新修订登记为 `PENDING` 并重新拉取详情 |
 | 核实后立即可查 | 标记 `VERIFIED` 后 `/cores/:id` 立刻返回 |
 | 增量进度只计连续核实范围 | `last_contiguous_verified_seq` 仅在发布序号连续且全部核实时向前推进 |
-| 全量期间发布的更正能被增量接上 | 增量从第 1 页重扫更正列表，upsert 幂等，天然接住遗漏修订 |
-| 强制结束后续跑 | 全部断点与核实结果落 DuckDB；重启读取 `run_state` 继续，残留 `RUNNING` 标记为 `INTERRUPTED` |
+| 较晚鉴定先核实、连续进度等缺口 | 核实按修订独立生效；`verifiedBeyondContiguous` 展示连续进度之外的已核实数 |
+| 全量期间及之后发布的更正能被增量接上 | 增量从第 1 页重扫更正列表，upsert 幂等；追加到原来末页的修订同样被接上 |
+| 强制结束后续跑 | 全部断点（含全量范围快照）与核实结果落 DuckDB；重启读取 `run_state` 继续，残留 `RUNNING` 标记为 `INTERRUPTED` |
 | 统一限流 / 在途上限 | 目录、列表、详情、重试请求共用一个 `HttpFetcher`：滑动窗口速率 + 信号量在途上限 |
 | Retry-After 全局等待 | 收到等待时间后设置全局 `pausedUntil`，后续所有请求统一等待 |
 
@@ -48,7 +52,9 @@ npm install
 npm run serve          # 启动：内嵌模拟站点(9090) + 采集/查询服务(8080)，自动全量采集
 ```
 
-全量完成后，服务按 `CATCHUP_INTERVAL_MS`（默认 3 秒）周期性增量追更正。
+内嵌站点启动时只公布一部分修订，之后按自身时钟**自行分批公布**更正（详情生效再滞后一拍）；
+采集端全量只覆盖「启动时已发布的范围」，核实一轮后即完成并交接给周期增量，
+不原地等待滞后详情。全量完成后，服务按 `CATCHUP_INTERVAL_MS`（默认 3 秒）周期性增量追更正。
 
 仅启动模拟站点（对接外部采集器时）：
 
@@ -63,9 +69,10 @@ EMBED_MOCK=0 MOCK_BASE_URL=http://127.0.0.1:9090 npm run serve
 npm run verify
 ```
 
-依赖安装后执行，约 20 秒输出可读结果（预算 80 秒内），覆盖：
-SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry-After、
-详情滞后→时钟推进→增量衔接、按编号查询与站点终态逐一比对。
+依赖安装后执行，约 35 秒输出可读结果（预算 80 秒内），覆盖：
+SIGKILL 强制结束→重启沿用原范围与已核实结果续跑、全量不等待滞后详情直接交接、
+站点自行分批公布→周期增量接上（含追加到原来末页的批次）、较晚鉴定先核实可查而连续进度等缺口补齐、
+重复链接合并、退避重试与 Retry-After、按编号查询与站点终态逐一比对。
 全部通过打印 `🎉 全部验证通过`，退出码 0。
 
 ## 5. HTTP 接口说明
@@ -109,7 +116,8 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 
 - `phase`：`IDLE` / `FULL` / `INCREMENTAL`
 - `catalog` / `corrections`：分页游标与总页数（断点）
-- `details`：`total` / `verified` / `pending`
+- `fullTargetSeq`：全量锁定的「启动时已发布」最大序号（快照落库，重启沿用）
+- `details`：`total` / `verified` / `pending` / `verifiedBeyondContiguous`（连续进度之外的已核实数）
 - `contiguousVerifiedSeq`：从上次进度起**连续核实**到的最大发布序号（增量进度口径）
 - `fullCompleted`：全量是否完成
 - `http`：累计请求数、重试次数、Retry-After 等待次数
@@ -129,13 +137,17 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 | `CATCHUP_INTERVAL_MS` | 3000 | 增量追更周期 |
 | `AUTO_FULL` | true | 启动是否自动全量 |
 | `EMBED_MOCK` | 1 | 是否进程内嵌模拟站点 |
+| `MOCK_INITIAL_PUBLISHED` | 35 | 模拟站点启动时已公布的修订数 |
+| `MOCK_PUBLISH_BATCH` / `MOCK_PUBLISH_INTERVAL_MS` | 6 / 3000 | 模拟站点每批自行公布的修订数 / 公布间隔 |
+| `MOCK_INITIAL_DETAIL` | 20 | 模拟站点启动时详情已生效到的发布序号 |
+| `MOCK_DETAIL_BATCH` / `MOCK_DETAIL_INTERVAL_MS` | 5 / 2500 | 详情生效时钟每步推进序号数 / 推进间隔 |
 
 ## 7. 存储模型（DuckDB）
 
 - `identifications`：每个 `(core_id, revision)` 一行，`PENDING`/`VERIFIED` 状态 + 核实内容 + 尝试次数
 - `fetch_urls`：已抓取 URL（去重与尝试次数证据）
 - `runs`：每次全量/增量运行记录（含中断标记）
-- `run_state`：单行断点表（目录/更正游标、连续核实序号、全量完成标志）
+- `run_state`：单行断点表（目录/更正游标、全量目标序号快照、连续核实序号、全量完成标志）
 
 > 说明：duckdb 1.4.x 的 Node 绑定无法序列化 BIGINT、不支持绑定 `null`、参数需展开传递，
 > 存储层已统一处理（序号列用 INTEGER、空值内联类型化 NULL、rest 参数展开），对上层透明。

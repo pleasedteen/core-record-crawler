@@ -31,7 +31,8 @@ async function main(): Promise<void> {
     await new Promise<void>((resolve) => mockServer!.listen(config.mockPort, "127.0.0.1", resolve));
     console.log(
       `[mock] 内嵌离线模拟站点已启动: http://127.0.0.1:${config.mockPort} ` +
-        `（已发布修订 ${site.totalPublished} 条，详情生效时钟初始 ${site.detailClock}）`,
+        `（修订共 ${site.finalTotal} 条，启动已公布 ${site.publishedCount} 条；` +
+        `之后站点自行分批公布，详情生效滞后于公布）`,
     );
     // 默认指向内嵌站点；显式设置 MOCK_BASE_URL 时以外部站点为准
     if (!process.env.MOCK_BASE_URL) baseUrl = `http://127.0.0.1:${config.mockPort}`;

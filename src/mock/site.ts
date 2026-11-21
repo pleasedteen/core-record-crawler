@@ -5,7 +5,9 @@
  *  - 分页 HTML 馆藏目录：/catalog?page=N，含重复链接，页头/页脚标明总页数
  *  - JSON 更正列表：/corrections?page=N，按发布顺序翻页
  *  - 岩芯详情页：/core/:id，同一岩芯多个修订共用同一地址
- *  - 修订发布后，详情页可能暂时仍显示旧修订（详情延迟生效）
+ *  - 站点【自行分批公布】更正：启动时只公布一部分，之后按自身时钟逐批公布，
+ *    无需外部推进；后公布的修订可能追加到原来的末页
+ *  - 修订公布后，详情页可能暂时仍显示旧修订（详情生效时钟滞后于公布进度，同样自行推进）
  *  - 早期鉴定可能在“当天”即被更正（相同日期、不同 revision）
  *  - 临时拒绝：503 + Retry-After，以及随机 500
  *
@@ -35,6 +37,14 @@ const NUM_CORES = 40;
 const CLASSIFICATIONS = ["砂岩", "泥岩", "灰岩", "页岩", "花岗岩", "玄武岩", "白云岩", "砾岩"];
 const FORMATIONS = ["青山组", "白河组", "龙泉组", "丹霞组", "苍海组", "石林组"];
 const VERIFIERS = ["张核实", "李核实", "王核实", "赵核实"];
+
+/**
+ * 确定性植入：让发布序号 30 的修订详情显著滞后生效。
+ * 用于离线验证「全量不等待滞后详情 / 较晚鉴定先核实可查、连续进度等缺口补齐」，
+ * 不改变数据集终态。
+ */
+const PLANT_LAG_SEQ = 30;
+const PLANT_LAG = 25;
 
 function pad(n: number, width: number): string {
   return String(n).padStart(width, "0");
@@ -107,6 +117,12 @@ function buildRevisions(): Map<string, CoreRevision[]> {
 
   // 按发布时间排序每个岩芯的修订（同日更正也有序），并归一化详情生效序号
   const globalMaxSeq = seq;
+  // 植入一条详情显著滞后的修订（确定性构造“列表已公布、详情长期未生效”的场景）
+  for (const list of cores.values()) {
+    for (const rev of list) {
+      if (rev.publishedSeq === PLANT_LAG_SEQ) rev.detailReadySeq = rev.publishedSeq + PLANT_LAG;
+    }
+  }
   for (const list of cores.values()) {
     list.sort((a, b) => a.publishedSeq - b.publishedSeq);
     // 截断到全局最大发布序号：保留“相对发布滞后生效”，同时保证每个修订
@@ -123,39 +139,42 @@ export class MockArchiveSite {
   private allRevisions: CoreRevision[];
   private rng = mulberry32(987654321);
   private requestCount = 0;
-  readonly totalPublished: number;
-  /**
-   * 站点时钟（发布序号口径）：更正列表一次性全部公布，
-   * 但详情页只展示 detailReadySeq <= clock 的修订，模拟“列表已更正、详情仍旧修订”。
-   */
-  private clock: number;
-  readonly initialClock: number;
+  /** 数据集中修订总数（最终会全部公布）。 */
+  readonly finalTotal: number;
+  private readonly startedAt = Date.now();
 
   constructor() {
     this.cores = buildRevisions();
     this.allRevisions = [...this.cores.values()]
       .flat()
       .sort((a, b) => a.publishedSeq - b.publishedSeq);
-    this.totalPublished = this.allRevisions.length;
-    // 初始只“生效”前 20 个发布序号对应的详情，其余陆续生效
-    this.initialClock = 20;
-    this.clock = this.initialClock;
+    this.finalTotal = this.allRevisions.length;
   }
 
-  /** 站点当前“已发布”的最大序号（更正列表口径）。 */
-  get currentMaxSeq(): number {
-    return this.totalPublished;
+  /**
+   * 站点当前“已公布”的修订数（更正列表口径）。
+   * 站点按自身时钟分批公布：启动时公布 mockInitialPublished 条，
+   * 之后每隔 mockPublishIntervalMs 自行公布一批，无需外部推进。
+   */
+  get publishedCount(): number {
+    const batches = Math.floor((Date.now() - this.startedAt) / config.mockPublishIntervalMs);
+    return Math.min(
+      this.finalTotal,
+      config.mockInitialPublished + batches * config.mockPublishBatch,
+    );
   }
 
-  /** 详情页生效时钟。 */
+  /**
+   * 详情页生效时钟（发布序号口径）：只展示 detailReadySeq <= 时钟 的修订，
+   * 模拟“列表已更正、详情仍旧修订”。时钟滞后于公布进度，同样由站点自行推进。
+   */
   get detailClock(): number {
-    return this.clock;
-  }
-
-  /** 推进详情生效时钟，返回推进后的值。 */
-  advanceClock(step = 6): number {
-    this.clock = Math.min(this.totalPublished, this.clock + step);
-    return this.clock;
+    const steps = Math.floor((Date.now() - this.startedAt) / config.mockDetailIntervalMs);
+    return Math.min(
+      this.finalTotal,
+      this.publishedCount,
+      config.mockInitialDetail + steps * config.mockDetailBatch,
+    );
   }
 
   /**
@@ -174,8 +193,12 @@ export class MockArchiveSite {
   }
 
   private catalogPages(): CoreRevision[][] {
-    // 目录只展示每个岩芯的“当前最新已发布修订”的链接，分页并刻意制造重复链接
-    const latest = [...this.cores.values()].map((l) => l[l.length - 1]);
+    // 目录只展示每个岩芯“当前最新【已公布】修订”的链接，分页并刻意制造重复链接；
+    // 尚未公布任何修订的岩芯暂时不出现在目录中
+    const published = this.publishedCount;
+    const latest = [...this.cores.values()]
+      .map((l) => l.filter((r) => r.publishedSeq <= published).at(-1))
+      .filter((r): r is CoreRevision => r !== undefined);
     latest.sort((a, b) => a.coreId.localeCompare(b.coreId));
     const pages: CoreRevision[][] = [];
     for (let i = 0; i < latest.length; i += PAGE_SIZE) pages.push(latest.slice(i, i + PAGE_SIZE));
@@ -216,9 +239,15 @@ ${rows.join("\n")}
   }
 
   private correctionsPage(page: number): { revisions: CoreRevision[]; page: number; totalPages: number } {
-    const totalPages = Math.max(1, Math.ceil(this.allRevisions.length / CORRECTION_PAGE_SIZE));
+    // 只放出已公布的修订；后续批次可能追加到原来的末页
+    const published = this.publishedCount;
+    const totalPages = Math.max(1, Math.ceil(published / CORRECTION_PAGE_SIZE));
     const start = (page - 1) * CORRECTION_PAGE_SIZE;
-    return { revisions: this.allRevisions.slice(start, start + CORRECTION_PAGE_SIZE), page, totalPages };
+    return {
+      revisions: this.allRevisions.slice(start, Math.min(start + CORRECTION_PAGE_SIZE, published)),
+      page,
+      totalPages,
+    };
   }
 
   private renderCorrections(page: number): string {
@@ -227,7 +256,7 @@ ${rows.join("\n")}
       page,
       totalPages,
       pageSize: CORRECTION_PAGE_SIZE,
-      totalPublished: this.totalPublished,
+      totalPublished: this.publishedCount,
       items: revisions.map((r) => ({
         coreId: r.coreId,
         revision: r.revision,
@@ -249,7 +278,7 @@ ${rows.join("\n")}
   private renderDetail(coreId: string): string | null {
     const list = this.cores.get(coreId);
     if (!list) return null;
-    const visibleRevisions = list.filter((r) => r.detailReadySeq <= this.clock);
+    const visibleRevisions = list.filter((r) => r.detailReadySeq <= this.detailClock);
     if (visibleRevisions.length === 0) return null;
     const shown = visibleRevisions[visibleRevisions.length - 1];
     const latest = list[list.length - 1];
@@ -342,29 +371,14 @@ ${history}
         return send(200, html, "text/html");
       }
 
-      // 管理接口（离线验证用）：推进/重置详情生效时钟
-      if (url.pathname === "/__admin/advance-clock") {
-        const step = Number(url.searchParams.get("step") ?? "6") || 6;
-        return send(
-          200,
-          JSON.stringify({ clock: this.advanceClock(step), totalPublished: this.totalPublished }),
-          "application/json",
-        );
-      }
-      if (url.pathname === "/__admin/reset-clock") {
-        this.clock = this.initialClock;
-        return send(
-          200,
-          JSON.stringify({ clock: this.clock, totalPublished: this.totalPublished }),
-          "application/json",
-        );
-      }
+      // 管理接口（离线验证用）：站点自行公布/生效，不需要外部推进，仅暴露状态查询
       if (url.pathname === "/__admin/state") {
         return send(
           200,
           JSON.stringify({
-            clock: this.clock,
-            totalPublished: this.totalPublished,
+            published: this.publishedCount,
+            finalTotal: this.finalTotal,
+            detailClock: this.detailClock,
             expectedFinalState: this.expectedFinalState,
           }),
           "application/json",
@@ -395,7 +409,8 @@ if (invokedPath.endsWith("site.ts") || invokedPath.endsWith("site.js")) {
   server.listen(config.mockPort, "127.0.0.1", () => {
     console.log(
       `[mock] 离线模拟馆藏站点已启动: http://127.0.0.1:${config.mockPort} ` +
-        `(岩芯 ${NUM_CORES} 个，已发布修订 ${site.totalPublished} 条)`,
+        `(岩芯 ${NUM_CORES} 个，修订共 ${site.finalTotal} 条；启动已公布 ${site.publishedCount} 条，` +
+        `之后站点自行分批公布，详情生效滞后于公布)`,
     );
   });
 }

@@ -44,6 +44,15 @@ export const config = {
   catchupIntervalMs: num("CATCHUP_INTERVAL_MS", 3000),
   /** 服务启动后是否自动执行全量采集 */
   autoFull: bool("AUTO_FULL", true),
+  /** 模拟站点：启动时已公布的修订数（之后按批自行公布，无需外部推进） */
+  mockInitialPublished: num("MOCK_INITIAL_PUBLISHED", 35),
+  /** 模拟站点：每批自行公布的修订数 / 公布间隔 */
+  mockPublishBatch: num("MOCK_PUBLISH_BATCH", 6),
+  mockPublishIntervalMs: num("MOCK_PUBLISH_INTERVAL_MS", 3000),
+  /** 模拟站点：启动时详情已生效到的发布序号（之后自行推进，滞后于公布） */
+  mockInitialDetail: num("MOCK_INITIAL_DETAIL", 20),
+  mockDetailBatch: num("MOCK_DETAIL_BATCH", 5),
+  mockDetailIntervalMs: num("MOCK_DETAIL_INTERVAL_MS", 2500),
 } as const;
 
 export type AppConfig = typeof config;
