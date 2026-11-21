@@ -40,8 +40,8 @@ function pad(n: number, width: number): string {
   return String(n).padStart(width, "0");
 }
 
-function buildRevisions(): Map<string, CoreRevision[]> {
-  const rng = mulberry32(20261118);
+function buildRevisions(seed: number): Map<string, CoreRevision[]> {
+  const rng = mulberry32(seed);
   const cores = new Map<string, CoreRevision[]>();
 
   // 1) 生成每个岩芯的初始鉴定（发布序号 1..N）
@@ -118,11 +118,25 @@ function buildRevisions(): Map<string, CoreRevision[]> {
   return cores;
 }
 
+export interface MockSiteOptions {
+  /** 数据集确定性种子：不同种子让两个站对同号岩芯产出不同鉴定内容（验证内容隔离）。 */
+  seed?: number;
+  /** 随机故障注入开关（默认开启；确定性等待测试可关闭后改用 force-503）。 */
+  randomFaults?: boolean;
+}
+
 export class MockArchiveSite {
   private cores: Map<string, CoreRevision[]>;
   private allRevisions: CoreRevision[];
   private rng = mulberry32(987654321);
   private requestCount = 0;
+  private readonly randomFaults: boolean;
+  /** 强制下一次（或接下来 N 次）采集请求返回 503 + Retry-After，确定性验证站点等待。 */
+  private forced503Remaining = 0;
+  private forcedRetryAfterSec = 1;
+  /** 采集类请求的实时在途数与历史高水位（验证两站共享在途上限用；管理接口不计入）。 */
+  private inflightNow = 0;
+  private inflightPeak = 0;
   readonly totalPublished: number;
   /**
    * 站点时钟（发布序号口径）：更正列表一次性全部公布，
@@ -131,8 +145,10 @@ export class MockArchiveSite {
   private clock: number;
   readonly initialClock: number;
 
-  constructor() {
-    this.cores = buildRevisions();
+  constructor(opts: MockSiteOptions = {}) {
+    const seed = opts.seed ?? 20261118;
+    this.randomFaults = opts.randomFaults ?? true;
+    this.cores = buildRevisions(seed);
     this.allRevisions = [...this.cores.values()]
       .flat()
       .sort((a, b) => a.publishedSeq - b.publishedSeq);
@@ -161,8 +177,17 @@ export class MockArchiveSite {
   /**
    * 临时故障注入：约 12% 请求 503（带 Retry-After），约 6% 请求 500。
    * 用请求计数做确定性伪随机，重试时计数继续推进，最终一定能成功。
+   * 强制 503（管理接口设置）优先级最高，用于确定性验证“站点等待时间”。
    */
   private transientFault(): { status: number; retryAfter?: number } | null {
+    if (this.forced503Remaining > 0) {
+      this.forced503Remaining -= 1;
+      return { status: 503, retryAfter: this.forcedRetryAfterSec };
+    }
+    if (!this.randomFaults) {
+      this.requestCount += 1;
+      return null;
+    }
     this.requestCount += 1;
     const r = this.rng();
     if (r < 0.12) {
@@ -171,6 +196,12 @@ export class MockArchiveSite {
     }
     if (r < 0.18) return { status: 500 };
     return null;
+  }
+
+  /** 让接下来 count 个采集请求确定性地返回 503 + Retry-After。 */
+  forceNext503(count = 1, retryAfterSec = 1): void {
+    this.forced503Remaining = count;
+    this.forcedRetryAfterSec = retryAfterSec;
   }
 
   private catalogPages(): CoreRevision[][] {
@@ -309,16 +340,67 @@ ${history}
         res.end(body);
       };
 
+      // 管理接口（离线验证用）：不受故障注入影响、不计入采集在途
+      if (url.pathname.startsWith("/__admin/")) {
+        if (url.pathname === "/__admin/advance-clock") {
+          const step = Number(url.searchParams.get("step") ?? "6") || 6;
+          return send(
+            200,
+            JSON.stringify({ clock: this.advanceClock(step), totalPublished: this.totalPublished }),
+            "application/json",
+          );
+        }
+        if (url.pathname === "/__admin/reset-clock") {
+          this.clock = this.initialClock;
+          return send(
+            200,
+            JSON.stringify({ clock: this.clock, totalPublished: this.totalPublished }),
+            "application/json",
+          );
+        }
+        if (url.pathname === "/__admin/force-503") {
+          const count = Number(url.searchParams.get("count") ?? "1") || 1;
+          const retryAfter = Number(url.searchParams.get("retryAfter") ?? "1") || 1;
+          this.forceNext503(count, retryAfter);
+          return send(
+            200,
+            JSON.stringify({ forced503Remaining: this.forced503Remaining, retryAfter }),
+            "application/json",
+          );
+        }
+        if (url.pathname === "/__admin/state") {
+          return send(
+            200,
+            JSON.stringify({
+              clock: this.clock,
+              totalPublished: this.totalPublished,
+              inflightNow: this.inflightNow,
+              inflightPeak: this.inflightPeak,
+              expectedFinalState: this.expectedFinalState,
+            }),
+            "application/json",
+          );
+        }
+        return send(404, "未找到管理接口", "text/plain");
+      }
+
+      // 采集类请求：计入在途观测，再做故障注入
+      this.inflightNow += 1;
+      if (this.inflightNow > this.inflightPeak) this.inflightPeak = this.inflightNow;
+      const done = (): void => {
+        this.inflightNow -= 1;
+      };
+      res.on("finish", done);
+      res.on("close", done);
+
       const fault = this.transientFault();
       if (fault) {
         if (fault.status === 503) {
-          send(503, `服务临时繁忙，请 ${fault.retryAfter} 秒后重试`, "text/plain", {
+          return send(503, `服务临时繁忙，请 ${fault.retryAfter} 秒后重试`, "text/plain", {
             "Retry-After": String(fault.retryAfter),
           });
-        } else {
-          send(500, "站点内部临时错误", "text/plain");
         }
-        return;
+        return send(500, "站点内部临时错误", "text/plain");
       }
 
       if (url.pathname === "/catalog" || url.pathname === "/") {
@@ -340,35 +422,6 @@ ${history}
         const html = this.renderDetail(m[1]);
         if (html === null) return send(404, "岩芯不存在", "text/plain");
         return send(200, html, "text/html");
-      }
-
-      // 管理接口（离线验证用）：推进/重置详情生效时钟
-      if (url.pathname === "/__admin/advance-clock") {
-        const step = Number(url.searchParams.get("step") ?? "6") || 6;
-        return send(
-          200,
-          JSON.stringify({ clock: this.advanceClock(step), totalPublished: this.totalPublished }),
-          "application/json",
-        );
-      }
-      if (url.pathname === "/__admin/reset-clock") {
-        this.clock = this.initialClock;
-        return send(
-          200,
-          JSON.stringify({ clock: this.clock, totalPublished: this.totalPublished }),
-          "application/json",
-        );
-      }
-      if (url.pathname === "/__admin/state") {
-        return send(
-          200,
-          JSON.stringify({
-            clock: this.clock,
-            totalPublished: this.totalPublished,
-            expectedFinalState: this.expectedFinalState,
-          }),
-          "application/json",
-        );
       }
 
       send(404, "未找到", "text/plain");
