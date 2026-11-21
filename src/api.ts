@@ -140,13 +140,17 @@ export function createApiServer(db: Database, collector: Collector): http.Server
         return row ? json(res, 200, row) : json(res, 404, { error: "运行记录不存在" });
       }
 
-      // 汇总统计（验证用：URL 去重、重试、核实计数）
+      // 汇总统计（验证用：URL 去重、重试、核实计数、更正列表逐页请求次数）
       if (p === "/stats" && req.method === "GET") {
         const urlKinds = await db.all<{ kind: string; n: number; attempts_sum: number }>(
           `SELECT kind,
                   CAST(COUNT(*) AS INTEGER) AS n,
                   CAST(COALESCE(SUM(attempts), 0) AS INTEGER) AS attempts_sum
              FROM fetch_urls GROUP BY kind ORDER BY kind`,
+        );
+        const correctionPageUrls = await db.all<{ url: string; attempts: number; status: string }>(
+          `SELECT url, CAST(attempts AS INTEGER) AS attempts, status
+             FROM fetch_urls WHERE kind = 'CORRECTIONS' ORDER BY url`,
         );
         const runStatus = await db.all<{ status: string; n: number }>(
           `SELECT status, CAST(COUNT(*) AS INTEGER) AS n FROM runs GROUP BY status ORDER BY status`,
@@ -162,6 +166,11 @@ export function createApiServer(db: Database, collector: Collector): http.Server
             kind: r.kind,
             distinctUrls: Number(r.n),
             totalAttempts: Number(r.attempts_sum),
+          })),
+          correctionPageUrls: correctionPageUrls.map((r) => ({
+            url: r.url,
+            attempts: Number(r.attempts),
+            status: r.status,
           })),
           runs: runStatus.map((r) => ({ status: r.status, count: Number(r.n) })),
         });

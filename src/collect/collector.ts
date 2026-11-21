@@ -2,19 +2,31 @@
  * 采集编排器。
  *
  * 流程：
- *  全量：分页抓取目录（重复链接去重合并）→ 按发布顺序抓更正列表（登记全部修订）
+ *  全量：分页抓取目录（重复链接去重合并）→ 按发布顺序翻页抓更正列表（登记全部修订；
+ *        站点以 HTTP 200 返回别页正文时按页码识别为错页，本页留缺、正文仍登记）
  *        → 并发拉详情核实待核实修订（详情仍旧修订则保留 PENDING 等待复查）
- *        → 全部核实后全量完成；之后周期性增量追更正。
- *  增量：重扫更正列表发现新修订 → 复查所有 PENDING（含上次遗留的详情滞后修订）
- *        → 只把“从上次进度开始连续核实”的发布范围计入增量进度。
+ *        → 已登记修订全部核实后全量完成；之后周期性增量追更正。
+ *  增量：每轮按可配置的列表请求预算（重试计入）检查更正列表——预算内旧缺页
+ *        与末页都有检查机会；缺页恢复、末页追加都在此接上
+ *        → 复查所有 PENDING（含上次遗留的详情滞后修订）
+ *        → 只把“从上次进度开始连续核实”的发布范围计入增量进度；
+ *          缺口之后的有效更正核实后立即可查，但连续进度停在缺口前。
  *
- * 所有进度状态写入 DuckDB；进程被强制结束后重启，依据库内状态继续，
+ * 所有进度状态写入 DuckDB（含更正列表逐页收妥状态）；进程被强制结束后重启，
+ * 依据库内状态继续：已收妥的完整非尾页不重读，缺页与末页由追更轮继续，
  * 已保存的核实结果原样沿用。
  */
 import { config } from "../config.js";
 import { Database, IdentificationRow } from "../db.js";
-import { HttpFetcher } from "./http.js";
-import { parseCatalog, parseCorrections, parseDetail, CatalogLink, CorrectionItem } from "./parse.js";
+import { HttpFetcher, HttpError } from "./http.js";
+import {
+  parseCatalog,
+  parseCorrections,
+  parseDetail,
+  CatalogLink,
+  CorrectionItem,
+  CorrectionsPage,
+} from "./parse.js";
 import { sleep } from "../util/rng.js";
 
 export interface ProgressSnapshot {
@@ -30,6 +42,12 @@ export interface ProgressSnapshot {
     cursor: number;
     totalPages: number | null;
     totalPublished: number | null;
+    /** 尚未完整收妥的更正列表页（旧缺页；末页未收妥时也在内）。 */
+    missingPages: number[];
+    /** 每轮追更的列表请求预算（重试计入）。 */
+    listBudget: number;
+    /** 当前运行已发生的更正列表请求数（含重试）。 */
+    listRequestsThisRun: number;
   };
   details: {
     total: number;
@@ -54,6 +72,8 @@ export class Collector {
   private totalPublished: number | null = null;
   private stopRequested = false;
   private catchupTimer: NodeJS.Timeout | null = null;
+  /** 当前运行内更正列表的实际请求数（含重试），用于预算核算与运行记录。 */
+  private runListRequests = 0;
 
   constructor(
     private db: Database,
@@ -106,10 +126,11 @@ export class Collector {
       this.runId = await this.db.startRun("FULL");
       this.phase = "FULL";
       this.lastError = null;
+      this.runListRequests = 0;
       this.log(`全量采集开始（run #${this.runId}，支持中断后重启续跑）`);
 
       await this.crawlCatalog();
-      await this.crawlCorrections();
+      await this.crawlCorrectionsFull();
       // 详情可能滞后：多轮复查直到全部核实（每轮之间站点时钟会推进或重试退避）
       let pass = 0;
       while (!this.stopRequested) {
@@ -125,25 +146,27 @@ export class Collector {
       }
 
       if (this.stopRequested) {
-        await this.db.finishRun(this.runId!, "INTERRUPTED", "收到停止信号");
+        await this.db.finishRun(this.runId!, "INTERRUPTED", "收到停止信号", this.runListRequests);
         this.log("全量采集被中断，进度已保存，重启后续跑");
         return;
       }
 
       const contiguous = await this.recomputeContiguous(0);
-      const state = await this.db.getRunState();
       await this.db.saveRunState({
         full_completed: true,
         full_completed_at: new Date().toISOString(),
         last_contiguous_verified_seq: contiguous,
       });
-      await this.db.finishRun(this.runId!, "COMPLETED", null);
-      this.log(`全量采集完成：共 ${state.last_contiguous_verified_seq || contiguous} 个发布序号已连续核实`);
+      await this.db.finishRun(this.runId!, "COMPLETED", null, this.runListRequests);
+      this.log(
+        `全量采集完成：连续核实至发布序号 ${contiguous}` +
+          `${contiguous < (this.totalPublished ?? 0) ? `（更正列表尚有缺页 ${await this.describeMissingPages()}，由追更轮补齐）` : ""}`,
+      );
       this.scheduleCatchup(config.catchupIntervalMs);
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
       this.log(`全量采集出错：${this.lastError}（状态已保存，重启可续跑）`);
-      if (this.runId !== null) await this.db.finishRun(this.runId!, "FAILED", this.lastError);
+      if (this.runId !== null) await this.db.finishRun(this.runId!, "FAILED", this.lastError, this.runListRequests);
       // 出错后延迟自愈重启，避免崩溃退出
       setTimeout(() => void this.runFullForever(), 3000);
     } finally {
@@ -207,43 +230,232 @@ export class Collector {
   // ---------------- 更正列表 ----------------
 
   /**
-   * 抓取更正列表。
-   * @param rescan false（全量）：从持久化游标续跑，进程被杀后不重复翻页；
-   *               true（增量/重扫）：从第 1 页开始全量重扫，upsert 幂等去重，
-   *               这样全量期间发布的更正也一定能被后续增量接上，且能适应页数增长。
+   * 抓取一页更正列表（只发请求与解析，不落库）。
+   * 站点偶尔以 HTTP 200 返回别页正文：matched=false 时 parsed 是别页内容。
+   * maxAttempts 用于追更轮把退避重试也计入每轮列表请求预算。
    */
-  private async crawlCorrections(
-    rescan = false,
-  ): Promise<{ newestSeq: number; totalPages: number | null }> {
+  private async fetchCorrectionsPage(
+    page: number,
+    maxAttempts?: number,
+  ): Promise<{
+    attempts: number;
+    parsed: CorrectionsPage | null;
+    matched: boolean;
+    error: string | null;
+  }> {
+    const url = this.buildUrl(`/corrections?page=${page}`);
+    let attempts = 0;
+    try {
+      const res = await this.fetcher.get(url, maxAttempts !== undefined ? { maxAttempts } : undefined);
+      attempts = res.attempts;
+      let parsed: CorrectionsPage;
+      try {
+        parsed = parseCorrections(res.body);
+      } catch (err) {
+        return {
+          attempts,
+          parsed: null,
+          matched: false,
+          error: `更正列表第 ${page} 页正文解析失败：${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      return { attempts, parsed, matched: parsed.page === page, error: null };
+    } catch (err) {
+      if (err instanceof HttpError && err.attempts > 0) attempts = err.attempts;
+      if (attempts === 0) attempts = 1;
+      return {
+        attempts,
+        parsed: null,
+        matched: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  /**
+   * 登记一页更正列表正文（无论是否错页响应，正文本身都是有效数据）：
+   * 登记全部条目、把正文对应页标记为已收妥、记录总页数变化。
+   * 总页数变大时旧末页可能又追加了条目，置回待补（除非本次正文就是旧末页）。
+   */
+  private async ingestCorrectionsPayload(
+    parsed: CorrectionsPage,
+    ctx: { totalPages: number | null },
+  ): Promise<void> {
+    this.totalPublished = parsed.totalPublished;
+    if (
+      ctx.totalPages !== null &&
+      parsed.totalPages > ctx.totalPages &&
+      parsed.page !== ctx.totalPages
+    ) {
+      await this.db.invalidateCorrectionPage(ctx.totalPages);
+    }
+    if (parsed.totalPages > (ctx.totalPages ?? 0)) ctx.totalPages = parsed.totalPages;
+
+    for (const item of parsed.items) await this.registerCorrection(item);
+    await this.db.markCorrectionPageComplete(parsed.page, parsed.items.length);
+    await this.db.recordUrl(this.buildUrl(`/corrections?page=${parsed.page}`), "CORRECTIONS", "DONE", null);
+  }
+
+  /** 当前未完整收妥的更正列表页（含未收妥的末页）。 */
+  private async listMissingPages(totalPages: number | null): Promise<number[]> {
+    if (totalPages === null || totalPages <= 0) return [];
+    const complete = new Set(await this.db.listCompleteCorrectionPages());
+    const missing: number[] = [];
+    for (let p = 1; p <= totalPages; p++) if (!complete.has(p)) missing.push(p);
+    return missing;
+  }
+
+  private async describeMissingPages(): Promise<string> {
     const state = await this.db.getRunState();
-    let page = rescan ? 1 : state.correction_page_cursor + 1;
-    let totalPages = rescan ? null : state.correction_total_pages;
-    let newestSeq = state.last_contiguous_verified_seq;
+    const missing = await this.listMissingPages(
+      state.correction_total_pages === null ? null : Number(state.correction_total_pages),
+    );
+    return missing.length > 0 ? missing.join(",") : "无";
+  }
+
+  /**
+   * 全量走查更正列表：从持久化游标续跑，进程被杀后不重复翻页；
+   * 已收妥的页（含错页响应顺带收妥的页）直接跳过不重读。
+   * 错页页留缺（游标照常前进），由后续追更轮在预算内恢复。
+   */
+  private async crawlCorrectionsFull(): Promise<void> {
+    const state = await this.db.getRunState();
+    let page = state.correction_page_cursor + 1;
+    const ctx = { totalPages: state.correction_total_pages };
+    const completePages = new Set(await this.db.listCompleteCorrectionPages());
 
     while (!this.stopRequested) {
-      const url = this.buildUrl(`/corrections?page=${page}`);
-      const res = await this.fetcher.get(url);
-      const parsed = parseCorrections(res.body);
-      totalPages = parsed.totalPages;
-      this.totalPublished = parsed.totalPublished;
+      if (ctx.totalPages !== null && page > ctx.totalPages) break;
+      if (completePages.has(page)) {
+        this.log(`全量：更正列表第 ${page} 页已收妥，跳过重读`);
+        page += 1;
+        continue;
+      }
+      const r = await this.fetchCorrectionsPage(page);
+      this.runListRequests += r.attempts;
+      if (!r.parsed) {
+        // 与既有行为一致：硬失败让整轮失败并自愈重跑（游标已持久化，重启续跑）
+        throw new Error(`更正列表第 ${page} 页抓取失败：${r.error}`);
+      }
+      await this.ingestCorrectionsPayload(r.parsed, ctx);
+      completePages.add(r.parsed.page);
 
-      for (const item of parsed.items) await this.registerCorrection(item);
-      const maxSeq = parsed.items.reduce((m, it) => Math.max(m, it.publishedSeq), newestSeq);
-      newestSeq = maxSeq;
-
-      await this.db.recordUrl(url, "CORRECTIONS", "DONE", null);
+      if (!r.matched) {
+        // 错页：正文仍登记，但请求页留缺待补
+        await this.db.recordUrl(
+          this.buildUrl(`/corrections?page=${page}`),
+          "CORRECTIONS",
+          "FAILED",
+          `错页：站点返回第 ${r.parsed.page} 页正文`,
+        );
+        await this.db.recordCorrectionPageAttempt(page, `请求第 ${page} 页，站点返回第 ${r.parsed.page} 页正文`);
+        this.log(
+          `全量：更正列表第 ${page} 页错页（站点返回第 ${r.parsed.page} 页正文），本页留缺，待追更轮补齐`,
+        );
+      } else {
+        this.log(
+          `全量：更正列表第 ${page}/${ctx.totalPages} 页完成` +
+            `（本页 ${r.parsed.items.length} 条，已发布总数 ${r.parsed.totalPublished}）`,
+        );
+      }
       await this.db.saveRunState({
         correction_page_cursor: page,
-        correction_total_pages: totalPages,
+        correction_total_pages: ctx.totalPages,
       });
-      this.log(
-        `${rescan ? "重扫" : "全量"}更正列表第 ${page}/${totalPages} 页完成` +
-          `（本页 ${parsed.items.length} 条，已发布总数 ${parsed.totalPublished}）`,
-      );
       page += 1;
-      if (page > totalPages) break;
     }
-    return { newestSeq, totalPages };
+  }
+
+  /**
+   * 追更轮的预算制更正列表检查。
+   *
+   * 每轮预算 catchupListBudget 个列表请求（重试按实际请求数计入）；
+   * 轮内计划保证旧缺页与末页都有检查机会：缺页恢复与末页追加都在这里接上。
+   * 预算为 1 时按轮次奇偶在缺页与末页之间轮流。未收妥页排回队尾，
+   * 预算有剩余时本轮内重试；预算耗尽则留到下一轮。
+   */
+  private async crawlCorrectionsBudgeted(): Promise<void> {
+    const budget = Math.max(1, config.catchupListBudget);
+    const state = await this.db.getRunState();
+    const ctx = { totalPages: state.correction_total_pages };
+    if (ctx.totalPages === null || ctx.totalPages <= 0) {
+      // 防御性兜底：全量尚未走到更正列表就被中断，先顺序走查一遍
+      await this.crawlCorrectionsFull();
+      return;
+    }
+
+    const tail = ctx.totalPages;
+    const oldMissing = (await this.listMissingPages(ctx.totalPages)).filter((p) => p !== tail);
+    const parity = (await this.db.countRunsByMode("INCREMENTAL")) % 2;
+    const queue: number[] = [];
+    if (oldMissing.length === 0) {
+      queue.push(tail); // 无缺页：每轮仍复查末页，末页追加在此接上
+    } else if (parity === 0) {
+      queue.push(oldMissing[0], tail, ...oldMissing.slice(1));
+    } else {
+      queue.push(tail, ...oldMissing);
+    }
+
+    let spent = 0;
+    const completedThisRound = new Set<number>();
+    while (!this.stopRequested && queue.length > 0 && spent < budget) {
+      const page = queue.shift()!;
+      const r = await this.fetchCorrectionsPage(page, budget - spent);
+      spent += r.attempts;
+      this.runListRequests += r.attempts;
+
+      if (!r.parsed) {
+        await this.db.recordCorrectionPageAttempt(page, r.error ?? "未知错误");
+        this.log(`追更：更正列表第 ${page} 页抓取失败：${r.error}（本轮列表请求 ${spent}/${budget}）`);
+        queue.push(page);
+        continue;
+      }
+
+      const knownBefore = ctx.totalPages ?? 0;
+      await this.ingestCorrectionsPayload(r.parsed, ctx);
+      completedThisRound.add(r.parsed.page);
+      if ((ctx.totalPages ?? 0) > knownBefore) {
+        // 末页追加：新页排入检查计划（本轮已收妥的除外）；被置回待补的旧末页也重新排队
+        for (let p = knownBefore + 1; p <= (ctx.totalPages ?? 0); p++) {
+          if (!queue.includes(p) && !completedThisRound.has(p)) queue.push(p);
+        }
+        if (
+          r.parsed.page !== knownBefore &&
+          knownBefore > 0 &&
+          !queue.includes(knownBefore) &&
+          !completedThisRound.has(knownBefore)
+        ) {
+          queue.push(knownBefore);
+        }
+      }
+
+      if (!r.matched) {
+        // 错页：正文已登记，请求页仍缺，排回队尾预算内重试
+        await this.db.recordUrl(
+          this.buildUrl(`/corrections?page=${page}`),
+          "CORRECTIONS",
+          "FAILED",
+          `错页：站点返回第 ${r.parsed.page} 页正文`,
+        );
+        await this.db.recordCorrectionPageAttempt(page, `请求第 ${page} 页，站点返回第 ${r.parsed.page} 页正文`);
+        this.log(
+          `追更：更正列表第 ${page} 页错页（站点返回第 ${r.parsed.page} 页正文），本页留缺` +
+            `（本轮列表请求 ${spent}/${budget}）`,
+        );
+        queue.push(page);
+        continue;
+      }
+      this.log(
+        `追更：更正列表第 ${page}/${ctx.totalPages} 页完成` +
+          `（本页 ${r.parsed.items.length} 条，本轮列表请求 ${spent}/${budget}）`,
+      );
+    }
+
+    await this.db.saveRunState({ correction_total_pages: ctx.totalPages });
+    const remaining = await this.listMissingPages(ctx.totalPages);
+    if (remaining.length > 0) {
+      this.log(`追更：本轮预算 ${budget} 用完，仍缺页 ${remaining.join(",")}，下一轮继续`);
+    }
   }
 
   private async registerCorrection(item: CorrectionItem): Promise<void> {
@@ -359,13 +571,15 @@ export class Collector {
     this.phase = "INCREMENTAL";
     const runId = await this.db.startRun("INCREMENTAL");
     this.runId = runId;
+    this.runListRequests = 0;
     try {
       const before = await this.db.getRunState();
       const baseline = before.last_contiguous_verified_seq;
-      this.log(`增量追更正开始（上次连续核实序号 ${baseline}）`);
+      this.log(`增量追更正开始（上次连续核实序号 ${baseline}，本轮列表预算 ${Math.max(1, config.catchupListBudget)}）`);
 
-      // 重扫更正列表：全量期间发布的更正也会在这里登记并接上
-      const { newestSeq } = await this.crawlCorrections(true);
+      // 预算制检查更正列表：旧缺页恢复 + 末页追加都在此接上；
+      // 全量期间发布的更正也会经缺页/末页检查登记并接上
+      await this.crawlCorrectionsBudgeted();
 
       // 复查全部待核实修订（含详情滞后遗留 + 新发布修订）
       let pass = 0;
@@ -382,15 +596,16 @@ export class Collector {
         last_contiguous_verified_seq: contiguous,
         last_catchup_at: new Date().toISOString(),
       });
-      await this.db.finishRun(runId, "COMPLETED", null);
+      await this.db.finishRun(runId, "COMPLETED", null, this.runListRequests);
       this.log(
         `增量完成：本次新连续核实范围 (${baseline} → ${contiguous}]，` +
-          `站点已发布至 ${newestSeq}，待核实 ${(await this.db.countByStatus()).pending} 条`,
+          `站点已发布至 ${this.totalPublished ?? "?"}，待核实 ${(await this.db.countByStatus()).pending} 条，` +
+          `本轮列表请求 ${this.runListRequests}/${Math.max(1, config.catchupListBudget)}`,
       );
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
       this.log(`增量出错：${this.lastError}`);
-      await this.db.finishRun(runId, "FAILED", this.lastError);
+      await this.db.finishRun(runId, "FAILED", this.lastError, this.runListRequests);
     } finally {
       this.running = false;
       this.runId = null;
@@ -424,6 +639,7 @@ export class Collector {
   async snapshot(): Promise<ProgressSnapshot> {
     const state = await this.db.getRunState();
     const counts = await this.db.countByStatus();
+    const totalPages = state.correction_total_pages === null ? null : Number(state.correction_total_pages);
     return {
       phase: this.phase,
       running: this.running,
@@ -437,9 +653,11 @@ export class Collector {
       },
       corrections: {
         cursor: Number(state.correction_page_cursor),
-        totalPages:
-          state.correction_total_pages === null ? null : Number(state.correction_total_pages),
+        totalPages,
         totalPublished: this.totalPublished,
+        missingPages: await this.listMissingPages(totalPages),
+        listBudget: Math.max(1, config.catchupListBudget),
+        listRequestsThisRun: this.runListRequests,
       },
       details: {
         total: counts.verified + counts.pending,

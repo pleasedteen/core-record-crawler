@@ -15,12 +15,16 @@
 | 列表已更正、详情暂时仍旧修订 | 站点「详情生效时钟」控制，列表先公布、详情滞后生效；采集端保留 `PENDING` 并复查 |
 | 重复链接 | 目录刻意输出重复 `<li>`，采集端按详情 URL 去重合并 |
 | 临时拒绝 | 站点随机返回 503（带 `Retry-After`）与 500；采集端指数退避重试 |
+| 更正列表错页 | 站点偶尔以 HTTP 200 返回别页正文且同一页连续多次；采集端按页头页码识别，本页留缺待补 |
+| 每轮追更列表预算 | `CATCHUP_LIST_BUDGET` 限制每轮追更的更正列表请求数，重试按实际请求数计入；预算内旧缺页与末页都有检查机会 |
+| 缺页恢复与末页追加 | `correction_pages` 逐页记录收妥状态；缺页由追更轮补齐，末页每轮复查以接住追加 |
+| 强杀后不重读 | 已收妥的完整非尾页重启后不再请求；错页响应顺带收妥的页也跳过 |
 | 同一待核实修订只合并采集一次 | `identifications` 以 `(core_id, revision)` 为主键；同 URL 在途请求共享响应 |
 | 后续修订触发复查 | 每个 revision 独立判定，新修订登记为 `PENDING` 并重新拉取详情 |
-| 核实后立即可查 | 标记 `VERIFIED` 后 `/cores/:id` 立刻返回 |
-| 增量进度只计连续核实范围 | `last_contiguous_verified_seq` 仅在发布序号连续且全部核实时向前推进 |
-| 全量期间发布的更正能被增量接上 | 增量从第 1 页重扫更正列表，upsert 幂等，天然接住遗漏修订 |
-| 强制结束后续跑 | 全部断点与核实结果落 DuckDB；重启读取 `run_state` 继续，残留 `RUNNING` 标记为 `INTERRUPTED` |
+| 核实后立即可查 | 标记 `VERIFIED` 后 `/cores/:id` 立刻返回（缺口之后的较晚更正也一样） |
+| 增量进度只计连续核实范围 | `last_contiguous_verified_seq` 仅在发布序号连续且全部核实时向前推进；有缺页时停在缺口前 |
+| 全量期间发布的更正能被增量接上 | 追更轮检查缺页与末页，upsert 幂等，天然接住遗漏修订 |
+| 强制结束后续跑 | 全部断点、逐页收妥状态与核实结果落 DuckDB；重启读取 `run_state` / `correction_pages` 继续，残留 `RUNNING` 标记为 `INTERRUPTED` |
 | 统一限流 / 在途上限 | 目录、列表、详情、重试请求共用一个 `HttpFetcher`：滑动窗口速率 + 信号量在途上限 |
 | Retry-After 全局等待 | 收到等待时间后设置全局 `pausedUntil`，后续所有请求统一等待 |
 
@@ -63,8 +67,12 @@ EMBED_MOCK=0 MOCK_BASE_URL=http://127.0.0.1:9090 npm run serve
 npm run verify
 ```
 
-依赖安装后执行，约 20 秒输出可读结果（预算 80 秒内），覆盖：
+依赖安装后执行，约 35 秒输出可读结果（预算 90 秒内），覆盖：
 SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry-After、
+更正列表错页（HTTP 200 返回别页正文）→ 旧缺页连续几轮拿不到、
+缺口期间较晚更正已可查而连续进度停在缺口前、
+缺口期间再次 SIGKILL→同库重启→缺页恢复与末页追加接上、
+已收妥完整非尾页不重读（逐页请求次数比对）、每轮追更列表请求数 ≤ 预算、
 详情滞后→时钟推进→增量衔接、按编号查询与站点终态逐一比对。
 全部通过打印 `🎉 全部验证通过`，退出码 0。
 
@@ -109,6 +117,8 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 
 - `phase`：`IDLE` / `FULL` / `INCREMENTAL`
 - `catalog` / `corrections`：分页游标与总页数（断点）
+- `corrections.missingPages`：尚未完整收妥的更正列表页（旧缺页）
+- `corrections.listBudget` / `corrections.listRequestsThisRun`：每轮追更列表请求预算与本轮已发生请求数（含重试）
 - `details`：`total` / `verified` / `pending`
 - `contiguousVerifiedSeq`：从上次进度起**连续核实**到的最大发布序号（增量进度口径）
 - `fullCompleted`：全量是否完成
@@ -127,6 +137,7 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 | `MAX_RETRIES` / `RETRY_BASE_MS` / `RETRY_MAX_MS` | 8 / 250 / 8000 | 退避重试参数 |
 | `REQUEST_TIMEOUT_MS` | 8000 | 单次请求超时 |
 | `CATCHUP_INTERVAL_MS` | 3000 | 增量追更周期 |
+| `CATCHUP_LIST_BUDGET` | 8 | 每轮追更的更正列表请求预算（重试计入；预算内旧缺页与末页都有检查机会） |
 | `AUTO_FULL` | true | 启动是否自动全量 |
 | `EMBED_MOCK` | 1 | 是否进程内嵌模拟站点 |
 
@@ -134,7 +145,8 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 
 - `identifications`：每个 `(core_id, revision)` 一行，`PENDING`/`VERIFIED` 状态 + 核实内容 + 尝试次数
 - `fetch_urls`：已抓取 URL（去重与尝试次数证据）
-- `runs`：每次全量/增量运行记录（含中断标记）
+- `correction_pages`：更正列表逐页收妥状态（`COMPLETE`/`PENDING` + 尝试次数）；缺页 = 总页数内无 `COMPLETE` 行的页
+- `runs`：每次全量/增量运行记录（含中断标记、该轮更正列表请求数 `list_requests`）
 - `run_state`：单行断点表（目录/更正游标、连续核实序号、全量完成标志）
 
 > 说明：duckdb 1.4.x 的 Node 绑定无法序列化 BIGINT、不支持绑定 `null`、参数需展开传递，

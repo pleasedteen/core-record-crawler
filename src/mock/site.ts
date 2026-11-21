@@ -8,6 +8,8 @@
  *  - 修订发布后，详情页可能暂时仍显示旧修订（详情延迟生效）
  *  - 早期鉴定可能在“当天”即被更正（相同日期、不同 revision）
  *  - 临时拒绝：503 + Retry-After，以及随机 500
+ *  - 更正列表错页：偶尔以 HTTP 200 返回别页正文，且同一页的错页会持续若干次
+ *    （旧缺页可能连续几轮拿不到），采集端需识别页码不符并留缺待补
  *
  * 数据在站点启动时生成并保持稳定，保证可重复离线验证。
  */
@@ -130,6 +132,12 @@ export class MockArchiveSite {
    */
   private clock: number;
   readonly initialClock: number;
+  /**
+   * 更正列表错页故障：page → 剩余错页次数。
+   * 站点启动时按页确定性抽取（与请求到达顺序无关），命中错页的页
+   * 以 HTTP 200 返回别页正文；次数逐次消耗，因此同一缺页会连续几轮拿不到。
+   */
+  private wrongPageStreaks = new Map<number, number>();
 
   constructor() {
     this.cores = buildRevisions();
@@ -140,6 +148,17 @@ export class MockArchiveSite {
     // 初始只“生效”前 20 个发布序号对应的详情，其余陆续生效
     this.initialClock = 20;
     this.clock = this.initialClock;
+
+    // 预抽错页故障页（确定性，保证可重复离线验证）
+    const totalPages = Math.max(1, Math.ceil(this.allRevisions.length / CORRECTION_PAGE_SIZE));
+    if (totalPages >= 2) {
+      const faultRng = mulberry32(20261121);
+      for (let p = 1; p <= totalPages; p++) {
+        if (faultRng() < 0.3) {
+          this.wrongPageStreaks.set(p, 2 + Math.floor(faultRng() * 3));
+        }
+      }
+    }
   }
 
   /** 站点当前“已发布”的最大序号（更正列表口径）。 */
@@ -332,6 +351,13 @@ ${history}
         const page = Math.max(1, Number(url.searchParams.get("page") ?? "1") || 1);
         const { totalPages } = this.correctionsPage(page);
         if (page > totalPages) return send(404, "更正列表页不存在", "text/plain");
+        // 错页故障：HTTP 200 但正文是别页（页头 page 字段与请求页不符）
+        const streak = this.wrongPageStreaks.get(page) ?? 0;
+        if (streak > 0 && totalPages >= 2) {
+          this.wrongPageStreaks.set(page, streak - 1);
+          const other = (page % totalPages) + 1;
+          return send(200, this.renderCorrections(other), "application/json");
+        }
         return send(200, this.renderCorrections(page), "application/json");
       }
 

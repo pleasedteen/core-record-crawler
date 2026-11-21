@@ -42,6 +42,8 @@ export const config = {
   requestTimeoutMs: num("REQUEST_TIMEOUT_MS", 8000),
   /** 全量完成后定期追更正的间隔 */
   catchupIntervalMs: num("CATCHUP_INTERVAL_MS", 3000),
+  /** 每轮追更的更正列表请求预算（重试按实际请求数计入；预算内旧缺页与末页都会有检查机会） */
+  catchupListBudget: num("CATCHUP_LIST_BUDGET", 8),
   /** 服务启动后是否自动执行全量采集 */
   autoFull: bool("AUTO_FULL", true),
 } as const;

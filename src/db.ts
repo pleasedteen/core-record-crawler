@@ -63,6 +63,7 @@ export interface RunRow {
   details_pending: number;
   details_failed: number;
   contiguous_verified_seq: number;
+  list_requests: number;
   last_error: string | null;
 }
 
@@ -105,6 +106,18 @@ CREATE TABLE IF NOT EXISTS fetch_urls (
   fetched_at  TIMESTAMP NOT NULL
 );
 
+-- 更正列表逐页收妥状态：COMPLETE 表示该页正文已完整落库；
+-- 缺页（错页/失败）没有 COMPLETE 行，由追更轮在预算内恢复。
+-- 强杀重启后凭此表跳过已收妥的完整非尾页，只补缺页并复查末页。
+CREATE TABLE IF NOT EXISTS correction_pages (
+  page         INTEGER   NOT NULL PRIMARY KEY,
+  status       VARCHAR   NOT NULL DEFAULT 'PENDING',
+  items        INTEGER   NOT NULL DEFAULT 0,
+  attempts     INTEGER   NOT NULL DEFAULT 0,
+  last_error   VARCHAR,
+  fetched_at   TIMESTAMP NOT NULL
+);
+
 CREATE SEQUENCE IF NOT EXISTS runs_id_seq START 1;
 CREATE TABLE IF NOT EXISTS runs (
   id                     INTEGER    NOT NULL PRIMARY KEY
@@ -122,6 +135,7 @@ CREATE TABLE IF NOT EXISTS runs (
   details_pending        INTEGER    NOT NULL DEFAULT 0,
   details_failed         INTEGER    NOT NULL DEFAULT 0,
   contiguous_verified_seq INTEGER   NOT NULL DEFAULT 0,
+  list_requests          INTEGER    NOT NULL DEFAULT 0,
   last_error             VARCHAR
 );
 
@@ -160,6 +174,10 @@ export class Database {
     for (const stmt of DDL.split(";").map((s) => s.trim()).filter(Boolean)) {
       await wrapped.exec(stmt);
     }
+    // 兼容旧库：runs.list_requests 是后加列，幂等补齐
+    // （DuckDB 的 ADD COLUMN 不支持 NOT NULL 约束，先加可空列再回填）
+    await wrapped.exec(`ALTER TABLE runs ADD COLUMN IF NOT EXISTS list_requests INTEGER`);
+    await wrapped.exec(`UPDATE runs SET list_requests = 0 WHERE list_requests IS NULL`);
     await wrapped.exec(
       `INSERT INTO run_state (id, updated_at) VALUES (1, now())
        ON CONFLICT (id) DO NOTHING`,
@@ -389,6 +407,49 @@ export class Database {
     );
   }
 
+  // ---------- 更正列表逐页收妥状态 ----------
+
+  /** 已完整收妥的更正列表页（强杀重启后这些非尾页不再重读）。 */
+  async listCompleteCorrectionPages(): Promise<number[]> {
+    const rows = await this.all<{ page: number }>(
+      `SELECT page FROM correction_pages WHERE status = 'COMPLETE' ORDER BY page`,
+    );
+    return rows.map((r) => Number(r.page));
+  }
+
+  /** 某页正文已完整收妥（错页响应的正文页也算收妥对应页）。 */
+  async markCorrectionPageComplete(page: number, items: number): Promise<void> {
+    await this.exec(
+      `INSERT INTO correction_pages (page, status, items, attempts, last_error, fetched_at)
+       VALUES (?, 'COMPLETE', ?, 1, NULL, now())
+       ON CONFLICT (page) DO UPDATE SET
+         status = 'COMPLETE', items = excluded.items,
+         attempts = correction_pages.attempts + 1,
+         last_error = NULL, fetched_at = now()`,
+      [page, items],
+    );
+  }
+
+  /** 记录一次未收妥的页请求（错页或失败），页保持缺页状态。 */
+  async recordCorrectionPageAttempt(page: number, error: string): Promise<void> {
+    await this.exec(
+      `INSERT INTO correction_pages (page, status, items, attempts, last_error, fetched_at)
+       VALUES (?, 'PENDING', 0, 1, ?, now())
+       ON CONFLICT (page) DO UPDATE SET
+         attempts = correction_pages.attempts + 1,
+         last_error = excluded.last_error, fetched_at = now()`,
+      [page, error],
+    );
+  }
+
+  /** 总页数变大时，旧末页可能又追加了条目：把它置回待补（下次追更重读）。 */
+  async invalidateCorrectionPage(page: number): Promise<void> {
+    await this.exec(
+      `UPDATE correction_pages SET status = 'PENDING', fetched_at = now() WHERE page = ?`,
+      [page],
+    );
+  }
+
   // ---------- 运行与断点状态 ----------
 
   async getRunState(): Promise<RunStateRow> {
@@ -437,7 +498,7 @@ export class Database {
     return id;
   }
 
-  async finishRun(runId: number, status: string, error: string | null): Promise<void> {
+  async finishRun(runId: number, status: string, error: string | null, listRequests = 0): Promise<void> {
     const counts = await this.one<{
       details_total: number;
       details_verified: number;
@@ -457,7 +518,7 @@ export class Database {
          details_total = ?, details_verified = ?, details_pending = ?,
          details_failed = (SELECT CAST(COUNT(*) AS INTEGER) FROM identifications
                             WHERE status='PENDING' AND attempts > 0),
-         contiguous_verified_seq = ?, last_error = ?
+         contiguous_verified_seq = ?, list_requests = ?, last_error = ?
        WHERE id = ?`,
       [
         status,
@@ -469,11 +530,20 @@ export class Database {
         Number(counts?.details_verified ?? 0),
         Number(counts?.details_pending ?? 0),
         state.last_contiguous_verified_seq,
+        listRequests,
         error,
         runId,
       ],
     );
     await this.saveRunState({ active_run_id: null, mode: null });
+  }
+
+  async countRunsByMode(mode: string): Promise<number> {
+    const row = await this.one<{ n: number }>(
+      `SELECT CAST(COUNT(*) AS INTEGER) AS n FROM runs WHERE mode = ?`,
+      [mode],
+    );
+    return Number(row?.n ?? 0);
   }
 
   async listRuns(limit = 20): Promise<RunRow[]> {

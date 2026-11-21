@@ -14,16 +14,23 @@ export interface FetchResult {
   status: number;
   body: string;
   headers: Record<string, string>;
+  /** 本次 get 实际发出的 HTTP 请求数（含退避重试），供调用方计入请求预算。 */
+  attempts: number;
 }
 
 export class HttpError extends Error {
+  /** 失败前实际发出的请求数（含重试）。 */
+  attempts: number;
+
   constructor(
     message: string,
     readonly status: number | null,
     readonly retriable: boolean,
+    attempts = 0,
   ) {
     super(message);
     this.name = "HttpError";
+    this.attempts = attempts;
   }
 }
 
@@ -102,7 +109,7 @@ export class HttpFetcher {
     }
   }
 
-  private async dispatch(url: string): Promise<FetchResult> {
+  private async dispatch(url: string): Promise<Omit<FetchResult, "attempts">> {
     await this.permit();
     try {
       this.stats.requests += 1;
@@ -121,20 +128,27 @@ export class HttpFetcher {
     }
   }
 
-  /** 带退避重试的 GET。4xx（429 除外）视为不可重试错误。 */
-  async get(url: string): Promise<FetchResult> {
+  /**
+   * 带退避重试的 GET。4xx（429 除外）视为不可重试错误。
+   * opts.maxAttempts 可限制本次调用的最大实际请求数（含重试）：
+   * 追更轮的列表请求用它把退避重试也计入每轮预算。
+   */
+  async get(url: string, opts?: { maxAttempts?: number }): Promise<FetchResult> {
+    const maxAttempts = Math.max(1, opts?.maxAttempts ?? config.maxRetries + 1);
     let attempt = 0;
+    let dispatches = 0;
     let lastError: Error | null = null;
 
-    while (attempt <= config.maxRetries) {
+    while (attempt < maxAttempts) {
       attempt += 1;
-      let result: FetchResult;
+      let result: Omit<FetchResult, "attempts">;
       try {
+        dispatches += 1;
         result = await this.dispatch(url);
       } catch (err) {
         // 网络错误 / 超时：可重试
         lastError = err instanceof Error ? err : new Error(String(err));
-        if (attempt > config.maxRetries) break;
+        if (attempt >= maxAttempts) break;
         this.stats.retried += 1;
         await this.backoff(attempt, null);
         continue;
@@ -148,24 +162,33 @@ export class HttpFetcher {
           result.status,
           true,
         );
-        if (attempt > config.maxRetries) break;
+        if (attempt >= maxAttempts) break;
         this.stats.retried += 1;
         await this.backoff(attempt, raMs);
         continue;
       }
       if (result.status >= 500) {
         lastError = new HttpError(`服务端临时错误 ${result.status}`, result.status, true);
-        if (attempt > config.maxRetries) break;
+        if (attempt >= maxAttempts) break;
         this.stats.retried += 1;
         await this.backoff(attempt, null);
         continue;
       }
       if (result.status >= 400) {
-        throw new HttpError(`不可重试的客户端错误 ${result.status}: ${url}`, result.status, false);
+        throw new HttpError(`不可重试的客户端错误 ${result.status}: ${url}`, result.status, false, dispatches);
       }
-      return result;
+      return { ...result, attempts: dispatches };
     }
-    throw lastError ?? new HttpError(`请求失败（已重试 ${attempt - 1} 次）: ${url}`, null, true);
+    if (lastError instanceof HttpError) {
+      lastError.attempts = dispatches;
+      throw lastError;
+    }
+    throw new HttpError(
+      `${lastError?.message ?? `请求失败（已重试 ${Math.max(0, attempt - 1)} 次）`}: ${url}`,
+      null,
+      true,
+      dispatches,
+    );
   }
 
   private async backoff(attempt: number, retryAfterMs: number | null): Promise<void> {
