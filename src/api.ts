@@ -167,20 +167,41 @@ export function createApiServer(db: Database, collector: Collector): http.Server
         });
       }
 
-      // 手工触发：全量 / 增量
+      // 手工触发：全量 / 增量（与启动、定时共用统一运行入口 requestRun）
       if (p === "/collect/run-full" && req.method === "POST") {
         await readBody(req).catch(() => "");
-        const snap = await collector.snapshot();
-        if (snap.running) return json(res, 409, { error: "已有采集任务在运行", progress: snap });
-        void collector.runFullForever();
-        return json(res, 202, { triggered: "FULL", message: "全量采集已触发" });
+        const result = await collector.requestRun("FULL", "MANUAL");
+        if (!result.accepted) {
+          const snap = await collector.snapshot();
+          return json(res, 409, {
+            error: result.reason === "stopping" ? "服务正在停止，不再受理采集" : "已有采集任务在运行",
+            activeRunId: result.activeRunId,
+            progress: snap,
+          });
+        }
+        // 走到这里时 runs 记录已落库：运行历史立即可查到本次运行
+        return json(res, 202, {
+          triggered: "FULL",
+          runId: result.runId,
+          message: "全量采集已触发（运行记录已创建，可在 /runs 查询）",
+        });
       }
       if (p === "/collect/catchup" && req.method === "POST") {
         await readBody(req).catch(() => "");
-        const snap = await collector.snapshot();
-        if (snap.running) return json(res, 409, { error: "已有采集任务在运行", progress: snap });
-        void collector.runCatchup();
-        return json(res, 202, { triggered: "INCREMENTAL", message: "增量追更正已触发" });
+        const result = await collector.requestRun("INCREMENTAL", "MANUAL");
+        if (!result.accepted) {
+          const snap = await collector.snapshot();
+          return json(res, 409, {
+            error: result.reason === "stopping" ? "服务正在停止，不再受理采集" : "已有采集任务在运行",
+            activeRunId: result.activeRunId,
+            progress: snap,
+          });
+        }
+        return json(res, 202, {
+          triggered: "INCREMENTAL",
+          runId: result.runId,
+          message: "增量追更正已触发（运行记录已创建，可在 /runs 查询）",
+        });
       }
 
       return json(res, 404, {

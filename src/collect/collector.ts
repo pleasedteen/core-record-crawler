@@ -1,26 +1,41 @@
 /**
- * 采集编排器。
+ * 采集编排器（统一运行管理）。
  *
- * 流程：
+ * 三类触发——启动自动（STARTUP）、定时调度（SCHEDULED）、手工接口（MANUAL）——
+ * 全部走同一个受理入口 requestRun()：同步占位 → runs 落 RUNNING 记录 → 执行采集
+ * → closeRun 在单事务内同时写入完成进度与运行终态。
+ *  1) 手工触发：runs 记录插入成功后才返回 202，故返回时运行历史已可查到本次记录；
+ *  2) 并发竞争：同步占位保证同一时刻只有一个入口能开始采集，其余得到 409；
+ *  3) 等待站点（Retry-After / 详情滞后复查）期间不占任何库写锁，查询接口照常可用；
+ *  4) 强杀恢复：全部断点与核实结果落 DuckDB，重启把残留 RUNNING 标记为 INTERRUPTED，
+ *     已核实结果原样沿用，新运行从断点继续；
+ *  5) 进度与结案同事务：全量完成标志/增量连续序号与 runs 终态同时生效，不会撕裂。
+ *
+ * 采集流程：
  *  全量：分页抓取目录（重复链接去重合并）→ 按发布顺序抓更正列表（登记全部修订）
  *        → 并发拉详情核实待核实修订（详情仍旧修订则保留 PENDING 等待复查）
  *        → 全部核实后全量完成；之后周期性增量追更正。
  *  增量：重扫更正列表发现新修订 → 复查所有 PENDING（含上次遗留的详情滞后修订）
  *        → 只把“从上次进度开始连续核实”的发布范围计入增量进度。
- *
- * 所有进度状态写入 DuckDB；进程被强制结束后重启，依据库内状态继续，
- * 已保存的核实结果原样沿用。
  */
 import { config } from "../config.js";
-import { Database, IdentificationRow } from "../db.js";
+import { Database, IdentificationRow, RunTrigger } from "../db.js";
 import { HttpFetcher } from "./http.js";
 import { parseCatalog, parseCorrections, parseDetail, CatalogLink, CorrectionItem } from "./parse.js";
 import { sleep } from "../util/rng.js";
+
+export type RunMode = "FULL" | "INCREMENTAL";
+
+export type TriggerResult =
+  | { accepted: true; runId: number; mode: RunMode }
+  | { accepted: false; reason: "busy" | "stopping"; activeRunId: number | null };
 
 export interface ProgressSnapshot {
   phase: "IDLE" | "FULL" | "INCREMENTAL";
   running: boolean;
   runId: number | null;
+  /** 当前运行的触发来源：STARTUP / SCHEDULED / MANUAL（空闲时为 null）。 */
+  trigger: RunTrigger | null;
   catalog: {
     cursor: number;
     totalPages: number | null;
@@ -46,10 +61,16 @@ export interface ProgressSnapshot {
   updatedAt: string;
 }
 
+interface ActiveRun {
+  id: number;
+  mode: RunMode;
+  trigger: RunTrigger;
+  startedAt: number;
+}
+
 export class Collector {
-  private running = false;
-  private phase: ProgressSnapshot["phase"] = "IDLE";
-  private runId: number | null = null;
+  /** 运行槽位：同步读写，保证并发触发只有一个入口能占位成功。 */
+  private active: ActiveRun | null = null;
   private lastError: string | null = null;
   private totalPublished: number | null = null;
   private stopRequested = false;
@@ -61,6 +82,111 @@ export class Collector {
     private baseUrl: string,
   ) {}
 
+  // ---------------- 统一运行入口（启动 / 定时 / 手工共用） ----------------
+
+  /**
+   * 受理一次采集运行。三类触发共用本方法，行为一致：
+   *  - 同步检查并占位：在第一个 await 之前完成，并发请求只有一个能通过
+   *    （Node 单线程 + 同步代码不可交错，这是“竞争时只有一个入口能开始采集”的保证）；
+   *  - 先向 runs 插入 RUNNING 记录（手工 202 因此在返回前已可在运行历史查到）；
+   *  - 实际采集异步执行，本方法在“记录落库”后即返回。
+   */
+  requestRun(mode: RunMode, trigger: RunTrigger): Promise<TriggerResult> {
+    // —— 以下全部为同步代码：并发请求无论何时到达，都不可能同时通过占位检查 ——
+    if (this.stopRequested) {
+      return Promise.resolve({ accepted: false, reason: "stopping", activeRunId: this.active?.id ?? null });
+    }
+    if (this.active) {
+      return Promise.resolve({ accepted: false, reason: "busy", activeRunId: this.active.id });
+    }
+    // 先占槽位（runId 落库后回填），保证后续到达的请求同步看到“已有运行”
+    const token: ActiveRun = { id: 0, mode, trigger, startedAt: Date.now() };
+    this.active = token;
+    // —— 首个 await 之后槽位已属于本次受理 ——
+    return this.acceptRun(token);
+  }
+
+  private async acceptRun(token: ActiveRun): Promise<TriggerResult> {
+    const { mode, trigger } = token;
+    try {
+      // 先落库再返回：调用方收到受理结果时，/runs 已能查到本次 RUNNING 记录
+      const runId = await this.db.startRun(mode, trigger);
+      token.id = runId;
+    } catch (err) {
+      // 落库失败时释放槽位（仅当槽位仍属于本次受理），交由调用方按失败处理
+      if (this.active === token) this.active = null;
+      throw err;
+    }
+    this.lastError = null;
+    this.log(`运行受理：${mode}（run #${token.id}，触发来源 ${trigger}）`);
+    void this.executeRun(token);
+    return { accepted: true, runId: token.id, mode };
+  }
+
+  /** 运行执行主体：结束（完成/失败/中断）后统一走 closeRun 结案并恢复调度。 */
+  private async executeRun(active: ActiveRun): Promise<void> {
+    const { id: runId, mode, trigger } = active;
+    let terminalStatus: "COMPLETED" | "FAILED" | "INTERRUPTED" = "COMPLETED";
+    let terminalError: string | null = null;
+    let statePatch: Parameters<Database["closeRun"]>[3] = {};
+    let scheduleNextCatchup = false;
+
+    try {
+      if (mode === "FULL") {
+        const result = await this.runFullLoop();
+        if (this.stopRequested) {
+          terminalStatus = "INTERRUPTED";
+          terminalError = "收到停止信号";
+        } else {
+          terminalStatus = "COMPLETED";
+          statePatch = result.statePatch;
+          scheduleNextCatchup = true;
+        }
+      } else {
+        const result = await this.runIncrementalLoop();
+        if (this.stopRequested) {
+          terminalStatus = "INTERRUPTED";
+          terminalError = "收到停止信号";
+        } else {
+          terminalStatus = "COMPLETED";
+          statePatch = result.statePatch;
+        }
+      }
+    } catch (err) {
+      terminalStatus = "FAILED";
+      terminalError = err instanceof Error ? err.message : String(err);
+      this.lastError = terminalError;
+      this.log(`运行出错（run #${runId}）：${terminalError}（断点已保存，重启可续跑）`);
+    }
+
+    try {
+      // 进度与结案在同一事务提交：同时生效，外部观察不到中间态
+      await this.db.closeRun(runId, terminalStatus, terminalError, statePatch);
+    } catch (closeErr) {
+      // 结案事务本身失败：记录保留 RUNNING，重启恢复时判为 INTERRUPTED，不丢断点
+      this.lastError = closeErr instanceof Error ? closeErr.message : String(closeErr);
+      this.log(`结案事务失败（run #${runId}）：${this.lastError}（重启后按 INTERRUPTED 恢复）`);
+    }
+
+    // 仅当槽位仍属于本次运行时释放，避免与重启/重入路径串扰
+    if (this.active === active) this.active = null;
+    this.log(`运行结案：run #${runId} → ${terminalStatus}`);
+
+    if (this.stopRequested) return;
+
+    // 保留既有调度规则：
+    //  - 全量完成/失败后按周期安排增量；全量失败额外 3s 自愈重启全量；
+    //  - 增量每次结束（含失败）后按周期重排，忙碌时 500ms 后重试。
+    if (mode === "FULL") {
+      if (terminalStatus === "FAILED") {
+        setTimeout(() => void this.requestRun("FULL", "STARTUP"), 3000);
+      }
+      this.scheduleCatchup(config.catchupIntervalMs);
+    } else if (scheduleNextCatchup || terminalStatus === "FAILED" || trigger === "SCHEDULED") {
+      this.scheduleCatchup(config.catchupIntervalMs);
+    }
+  }
+
   async start(autoFull: boolean): Promise<void> {
     // 进程被强制结束后重启：把上一轮残留的 RUNNING 运行标记为 INTERRUPTED。
     // 断点保留在 run_state 中，随后会新建运行续跑；正常完成的运行已是终态，不受影响。
@@ -69,6 +195,7 @@ export class Collector {
                        last_error = COALESCE(last_error, '进程被强制结束，重启后续跑')
         WHERE status = 'RUNNING'`,
     );
+    await this.db.saveRunState({ active_run_id: null, mode: null });
     const state = await this.db.getRunState();
     if (state.full_completed) {
       this.log(`检测到全量已完成（连续核实序号 ${state.last_contiguous_verified_seq}），进入增量模式`);
@@ -76,7 +203,7 @@ export class Collector {
       return;
     }
     if (autoFull) {
-      void this.runFullForever();
+      await this.requestRun("FULL", "STARTUP");
     }
   }
 
@@ -86,7 +213,7 @@ export class Collector {
     if (this.catchupTimer) clearTimeout(this.catchupTimer);
     // 等待当前运行循环让出
     const deadline = Date.now() + 3000;
-    while (this.running && Date.now() < deadline) await sleep(50);
+    while (this.active && Date.now() < deadline) await sleep(50);
   }
 
   private log(msg: string): void {
@@ -99,58 +226,40 @@ export class Collector {
 
   // ---------------- 全量 ----------------
 
-  async runFullForever(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    try {
-      this.runId = await this.db.startRun("FULL");
-      this.phase = "FULL";
-      this.lastError = null;
-      this.log(`全量采集开始（run #${this.runId}，支持中断后重启续跑）`);
+  /**
+   * 全量采集循环。正常结束时返回需要与结案同事务提交的进度补丁；
+   * 等待站点（Retry-After、详情滞后复查）期间只做 HTTP 等待，查询接口不受影响。
+   */
+  private async runFullLoop(): Promise<{ statePatch: Partial<import("../db.js").RunStateRow> }> {
+    this.log(`全量采集开始（run #${this.active!.id}，支持中断后重启续跑）`);
 
-      await this.crawlCatalog();
-      await this.crawlCorrections();
-      // 详情可能滞后：多轮复查直到全部核实（每轮之间站点时钟会推进或重试退避）
-      let pass = 0;
-      while (!this.stopRequested) {
-        pass += 1;
-        const pendingBefore = await this.db.listPending();
-        if (pendingBefore.length === 0) break;
-        this.log(`详情核实第 ${pass} 轮，待核实 ${pendingBefore.length} 条`);
-        await this.verifyPending(pendingBefore);
-        const still = await this.db.listPending();
-        if (still.length === 0) break;
-        this.log(`仍有 ${still.length} 条详情滞后，等待站点详情更新后复查`);
-        await sleep(500);
-      }
+    await this.crawlCatalog();
+    await this.crawlCorrections();
+    // 详情可能滞后：多轮复查直到全部核实（每轮之间站点时钟会推进或重试退避）
+    let pass = 0;
+    while (!this.stopRequested) {
+      pass += 1;
+      const pendingBefore = await this.db.listPending();
+      if (pendingBefore.length === 0) break;
+      this.log(`详情核实第 ${pass} 轮，待核实 ${pendingBefore.length} 条`);
+      await this.verifyPending(pendingBefore);
+      const still = await this.db.listPending();
+      if (still.length === 0) break;
+      this.log("仍有详情滞后，等待站点详情更新后复查（查询接口照常可用）");
+      await sleep(500);
+    }
+    if (this.stopRequested) return { statePatch: {} };
 
-      if (this.stopRequested) {
-        await this.db.finishRun(this.runId!, "INTERRUPTED", "收到停止信号");
-        this.log("全量采集被中断，进度已保存，重启后续跑");
-        return;
-      }
-
-      const contiguous = await this.recomputeContiguous(0);
-      const state = await this.db.getRunState();
-      await this.db.saveRunState({
+    const contiguous = await this.recomputeContiguous(0);
+    const state = await this.db.getRunState();
+    this.log(`全量采集完成：共 ${state.last_contiguous_verified_seq || contiguous} 个发布序号已连续核实`);
+    return {
+      statePatch: {
         full_completed: true,
         full_completed_at: new Date().toISOString(),
         last_contiguous_verified_seq: contiguous,
-      });
-      await this.db.finishRun(this.runId!, "COMPLETED", null);
-      this.log(`全量采集完成：共 ${state.last_contiguous_verified_seq || contiguous} 个发布序号已连续核实`);
-      this.scheduleCatchup(config.catchupIntervalMs);
-    } catch (err) {
-      this.lastError = err instanceof Error ? err.message : String(err);
-      this.log(`全量采集出错：${this.lastError}（状态已保存，重启可续跑）`);
-      if (this.runId !== null) await this.db.finishRun(this.runId!, "FAILED", this.lastError);
-      // 出错后延迟自愈重启，避免崩溃退出
-      setTimeout(() => void this.runFullForever(), 3000);
-    } finally {
-      this.running = false;
-      this.runId = null;
-      this.phase = "IDLE";
-    }
+      },
+    };
   }
 
   // ---------------- 目录 ----------------
@@ -163,6 +272,8 @@ export class Collector {
     let dupCount = 0;
 
     while (!this.stopRequested) {
+      // 续跑边界：上一轮已抓完全部目录页（含被杀重启）时直接结束，不再请求越界页码
+      if (totalPages !== null && page > totalPages) break;
       const url = this.buildUrl(`/catalog?page=${page}`);
       if (await this.db.hasFetchedUrl(url)) {
         page += 1;
@@ -221,6 +332,8 @@ export class Collector {
     let newestSeq = state.last_contiguous_verified_seq;
 
     while (!this.stopRequested) {
+      // 续跑边界：上一轮已抓完全部更正页（含被杀重启）时直接结束，避免请求越界页码
+      if (!rescan && totalPages !== null && page > totalPages) break;
       const url = this.buildUrl(`/corrections?page=${page}`);
       const res = await this.fetcher.get(url);
       const parsed = parseCorrections(res.body);
@@ -344,59 +457,47 @@ export class Collector {
   // ---------------- 增量 ----------------
 
   private scheduleCatchup(delayMs: number): void {
+    if (this.stopRequested) return;
     if (this.catchupTimer) clearTimeout(this.catchupTimer);
     this.catchupTimer = setTimeout(() => {
-      void this.runCatchup();
+      // 统一入口受理：定时与手工/启动完全一致；忙碌时短延迟重试（既有规则）
+      this.requestRun("INCREMENTAL", "SCHEDULED").then((result) => {
+        if (!result.accepted && result.reason === "busy") this.scheduleCatchup(500);
+      });
     }, delayMs);
   }
 
-  async runCatchup(): Promise<void> {
-    if (this.running) {
-      this.scheduleCatchup(500);
-      return;
+  /** 增量追更正循环；进度补丁与结案在同一事务提交。 */
+  private async runIncrementalLoop(): Promise<{ statePatch: Partial<import("../db.js").RunStateRow> }> {
+    const before = await this.db.getRunState();
+    const baseline = before.last_contiguous_verified_seq;
+    this.log(`增量追更正开始（run #${this.active!.id}，上次连续核实序号 ${baseline}）`);
+
+    // 重扫更正列表：全量期间发布的更正也会在这里登记并接上
+    const { newestSeq } = await this.crawlCorrections(true);
+
+    // 复查全部待核实修订（含详情滞后遗留 + 新发布修订）
+    let pass = 0;
+    while (!this.stopRequested && pass < 3) {
+      pass += 1;
+      const pending = await this.db.listPending();
+      if (pending.length === 0) break;
+      this.log(`增量复查第 ${pass} 轮，待核实 ${pending.length} 条`);
+      await this.verifyPending(pending);
     }
-    this.running = true;
-    this.phase = "INCREMENTAL";
-    const runId = await this.db.startRun("INCREMENTAL");
-    this.runId = runId;
-    try {
-      const before = await this.db.getRunState();
-      const baseline = before.last_contiguous_verified_seq;
-      this.log(`增量追更正开始（上次连续核实序号 ${baseline}）`);
+    if (this.stopRequested) return { statePatch: {} };
 
-      // 重扫更正列表：全量期间发布的更正也会在这里登记并接上
-      const { newestSeq } = await this.crawlCorrections(true);
-
-      // 复查全部待核实修订（含详情滞后遗留 + 新发布修订）
-      let pass = 0;
-      while (!this.stopRequested && pass < 3) {
-        pass += 1;
-        const pending = await this.db.listPending();
-        if (pending.length === 0) break;
-        this.log(`增量复查第 ${pass} 轮，待核实 ${pending.length} 条`);
-        await this.verifyPending(pending);
-      }
-
-      const contiguous = await this.recomputeContiguous(baseline);
-      await this.db.saveRunState({
+    const contiguous = await this.recomputeContiguous(baseline);
+    this.log(
+      `增量完成：本次新连续核实范围 (${baseline} → ${contiguous}]，` +
+        `站点已发布至 ${newestSeq}，待核实 ${(await this.db.countByStatus()).pending} 条`,
+    );
+    return {
+      statePatch: {
         last_contiguous_verified_seq: contiguous,
         last_catchup_at: new Date().toISOString(),
-      });
-      await this.db.finishRun(runId, "COMPLETED", null);
-      this.log(
-        `增量完成：本次新连续核实范围 (${baseline} → ${contiguous}]，` +
-          `站点已发布至 ${newestSeq}，待核实 ${(await this.db.countByStatus()).pending} 条`,
-      );
-    } catch (err) {
-      this.lastError = err instanceof Error ? err.message : String(err);
-      this.log(`增量出错：${this.lastError}`);
-      await this.db.finishRun(runId, "FAILED", this.lastError);
-    } finally {
-      this.running = false;
-      this.runId = null;
-      this.phase = "IDLE";
-      this.scheduleCatchup(config.catchupIntervalMs);
-    }
+      },
+    };
   }
 
   /**
@@ -425,9 +526,10 @@ export class Collector {
     const state = await this.db.getRunState();
     const counts = await this.db.countByStatus();
     return {
-      phase: this.phase,
-      running: this.running,
-      runId: this.runId,
+      phase: this.active ? this.active.mode : "IDLE",
+      running: this.active !== null,
+      runId: this.active?.id ?? null,
+      trigger: this.active?.trigger ?? null,
       catalog: {
         cursor: Number(state.catalog_page_cursor),
         totalPages: state.catalog_total_pages === null ? null : Number(state.catalog_total_pages),

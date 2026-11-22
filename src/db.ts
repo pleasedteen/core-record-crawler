@@ -48,9 +48,13 @@ export interface RunStateRow {
   updated_at: string;
 }
 
+export type RunTrigger = "STARTUP" | "SCHEDULED" | "MANUAL";
+
 export interface RunRow {
   id: number;
   mode: string;
+  /** 运行来源：启动自动 / 定时调度 / 手工触发（三类入口归同一套运行管理）。 */
+  run_trigger: string;
   started_at: string;
   finished_at: string | null;
   status: string;
@@ -110,6 +114,7 @@ CREATE TABLE IF NOT EXISTS runs (
   id                     INTEGER    NOT NULL PRIMARY KEY
                            DEFAULT CAST(nextval('runs_id_seq') AS INTEGER),
   mode                   VARCHAR   NOT NULL,
+  run_trigger            VARCHAR   NOT NULL DEFAULT 'STARTUP',
   started_at             TIMESTAMP NOT NULL,
   finished_at            TIMESTAMP,
   status                 VARCHAR   NOT NULL,
@@ -160,6 +165,16 @@ export class Database {
     for (const stmt of DDL.split(";").map((s) => s.trim()).filter(Boolean)) {
       await wrapped.exec(stmt);
     }
+    // 旧库迁移：统一运行管理给 runs 增加触发来源列（STARTUP/SCHEDULED/MANUAL）。
+    // DuckDB 的 ALTER TABLE ADD COLUMN 不支持 NOT NULL 约束，先加可空列再回填。
+    const cols = await wrapped.all<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'runs' AND column_name = 'run_trigger'`,
+    );
+    if (cols.length === 0) {
+      await wrapped.exec(`ALTER TABLE runs ADD COLUMN run_trigger VARCHAR`);
+      await wrapped.exec(`UPDATE runs SET run_trigger = 'STARTUP' WHERE run_trigger IS NULL`);
+    }
     await wrapped.exec(
       `INSERT INTO run_state (id, updated_at) VALUES (1, now())
        ON CONFLICT (id) DO NOTHING`,
@@ -187,16 +202,45 @@ export class Database {
   }
 
   private exec(sql: string, params: unknown[] = []): Promise<void> {
+    return this.mutex.run(() => this.raw(sql, params));
+  }
+
+  /**
+   * 在当前互斥锁内直接执行（不再加锁），供事务回调复用。
+   * duckdb 驱动签名为 all(sql, ...params, callback)：参数需展开传入。
+   */
+  private raw(sql: string, params: unknown[]): Promise<void> {
     const { sql: q, params: p } = this.bind(sql, params);
-    return this.mutex.run(
-      () =>
-        new Promise<void>((resolve, reject) => {
-          const cb = (err: Error | null) => (err ? reject(err) : resolve());
-          // duckdb 驱动签名为 all(sql, ...params, callback)：参数需展开传入
-          if (p.length === 0) this.db.all(q, cb);
-          else (this.db.all as unknown as (...a: unknown[]) => void)(q, ...p, cb);
-        }),
-    );
+    return new Promise<void>((resolve, reject) => {
+      const cb = (err: Error | null) => (err ? reject(err) : resolve());
+      if (p.length === 0) this.db.all(q, cb);
+      else (this.db.all as unknown as (...a: unknown[]) => void)(q, ...p, cb);
+    });
+  }
+
+  /** 互斥锁/事务内直接查询（不再加锁）。 */
+  private rawAll<T>(sql: string, params: unknown[]): Promise<T[]> {
+    const { sql: q, params: p } = this.bind(sql, params);
+    return new Promise<T[]>((resolve, reject) => {
+      const cb = (err: Error | null, rows: unknown[]) =>
+        err ? reject(err) : resolve(rows as T[]);
+      if (p.length === 0) this.db.all(q, cb);
+      else (this.db.all as unknown as (...a: unknown[]) => void)(q, ...p, cb);
+    });
+  }
+
+  /** 在互斥锁内以单事务执行一组写操作；任一步失败则整体回滚。 */
+  private async transaction(ops: () => Promise<void>): Promise<void> {
+    await this.mutex.run(async () => {
+      await this.raw("BEGIN TRANSACTION", []);
+      try {
+        await ops();
+        await this.raw("COMMIT", []);
+      } catch (err) {
+        await this.raw("ROLLBACK", []).catch(() => undefined);
+        throw err;
+      }
+    });
   }
 
   all<T>(sql: string, params: unknown[] = []): Promise<T[]> {
@@ -423,57 +467,95 @@ export class Database {
     );
   }
 
-  async startRun(mode: string): Promise<number> {
+  /** 统一运行入口的落库：显式记录触发来源（启动/定时/手工）。 */
+  async startRun(mode: string, trigger: RunTrigger): Promise<number> {
     // 显式取 INTEGER 序列值再插入：跨重启唯一递增，且避开 BIGINT/RETURNING 的驱动缺陷
     const seqRow = await this.one<{ n: number }>(
       `SELECT CAST(nextval('runs_id_seq') AS INTEGER) AS n`,
     );
     const id = Number(seqRow?.n ?? 1);
     await this.exec(
-      `INSERT INTO runs (id, mode, started_at, status) VALUES (?, ?, now(), 'RUNNING')`,
-      [id, mode],
+      `INSERT INTO runs (id, mode, run_trigger, started_at, status)
+       VALUES (?, ?, ?, now(), 'RUNNING')`,
+      [id, mode, trigger],
     );
     await this.saveRunState({ active_run_id: id, mode });
     return id;
   }
 
-  async finishRun(runId: number, status: string, error: string | null): Promise<void> {
-    const counts = await this.one<{
-      details_total: number;
-      details_verified: number;
-      details_pending: number;
-    }>(
-      `SELECT CAST(COUNT(*) AS INTEGER) AS details_total,
-              CAST(COUNT(*) FILTER (WHERE status='VERIFIED') AS INTEGER) AS details_verified,
-              CAST(COUNT(*) FILTER (WHERE status='PENDING')  AS INTEGER) AS details_pending
-         FROM identifications`,
-    );
-    const state = await this.getRunState();
-    await this.exec(
-      `UPDATE runs SET
-         finished_at = now(), status = ?,
-         catalog_pages_done = ?, catalog_total_pages = ?,
-         correction_pages_done = ?, correction_total_pages = ?,
-         details_total = ?, details_verified = ?, details_pending = ?,
-         details_failed = (SELECT CAST(COUNT(*) AS INTEGER) FROM identifications
-                            WHERE status='PENDING' AND attempts > 0),
-         contiguous_verified_seq = ?, last_error = ?
-       WHERE id = ?`,
-      [
-        status,
-        state.catalog_page_cursor,
-        state.catalog_total_pages,
-        state.correction_page_cursor,
-        state.correction_total_pages,
-        Number(counts?.details_total ?? 0),
-        Number(counts?.details_verified ?? 0),
-        Number(counts?.details_pending ?? 0),
-        state.last_contiguous_verified_seq,
-        error,
-        runId,
-      ],
-    );
-    await this.saveRunState({ active_run_id: null, mode: null });
+  /**
+   * 运行结案：进度（run_state）与运行终态（runs）在同一个 DuckDB 事务内提交，
+   * 保证“首次全量 / 本轮增量的完成进度”与“运行结案”同时生效——
+   * 即便进程在两者之间被 SIGKILL，也只会留下 RUNNING（重启判为 INTERRUPTED），
+   * 不会出现“已结案但进度未推进”或“进度已推进但运行仍在 RUNNING”的撕裂状态。
+   */
+  async closeRun(
+    runId: number,
+    status: string,
+    error: string | null,
+    statePatch: Partial<RunStateRow>,
+  ): Promise<void> {
+    await this.transaction(async () => {
+      const counts = await this.rawAll<{
+        details_total: number;
+        details_verified: number;
+        details_pending: number;
+      }>(
+        `SELECT CAST(COUNT(*) AS INTEGER) AS details_total,
+                CAST(COUNT(*) FILTER (WHERE status='VERIFIED') AS INTEGER) AS details_verified,
+                CAST(COUNT(*) FILTER (WHERE status='PENDING')  AS INTEGER) AS details_pending
+           FROM identifications`,
+        [],
+      );
+      const row = counts[0];
+      const cur = await this.rawAll<RunStateRow>(`SELECT * FROM run_state WHERE id = 1`, []);
+      const state: RunStateRow = { ...cur[0], ...statePatch };
+      const now = new Date().toISOString();
+
+      await this.raw(
+        `UPDATE runs SET
+           finished_at = now(), status = ?,
+           catalog_pages_done = ?, catalog_total_pages = ?,
+           correction_pages_done = ?, correction_total_pages = ?,
+           details_total = ?, details_verified = ?, details_pending = ?,
+           details_failed = (SELECT CAST(COUNT(*) AS INTEGER) FROM identifications
+                              WHERE status='PENDING' AND attempts > 0),
+           contiguous_verified_seq = ?, last_error = ?
+         WHERE id = ?`,
+        [
+          status,
+          state.catalog_page_cursor,
+          state.catalog_total_pages,
+          state.correction_page_cursor,
+          state.correction_total_pages,
+          Number(row?.details_total ?? 0),
+          Number(row?.details_verified ?? 0),
+          Number(row?.details_pending ?? 0),
+          state.last_contiguous_verified_seq,
+          error,
+          runId,
+        ],
+      );
+      await this.raw(
+        `UPDATE run_state SET
+           active_run_id = NULL, mode = NULL, catalog_page_cursor = ?, catalog_total_pages = ?,
+           correction_page_cursor = ?, correction_total_pages = ?,
+           last_contiguous_verified_seq = ?, full_completed = ?, full_completed_at = ?,
+           last_catchup_at = ?, updated_at = ?
+         WHERE id = 1`,
+        [
+          state.catalog_page_cursor,
+          state.catalog_total_pages,
+          state.correction_page_cursor,
+          state.correction_total_pages,
+          state.last_contiguous_verified_seq,
+          state.full_completed,
+          state.full_completed_at,
+          state.last_catchup_at,
+          now,
+        ],
+      );
+    });
   }
 
   async listRuns(limit = 20): Promise<RunRow[]> {

@@ -123,6 +123,12 @@ export class MockArchiveSite {
   private allRevisions: CoreRevision[];
   private rng = mulberry32(987654321);
   private requestCount = 0;
+  /**
+   * 暂停注入：非空期间所有数据接口统一返回 503 + Retry-After，
+   * 用于离线验证「等待站点期间查询接口照常可用、采集运行仍处 RUNNING」。
+   * 管理接口（/__admin/*）不受暂停影响，保证验证脚本可控恢复。
+   */
+  private pausedUntil = 0;
   readonly totalPublished: number;
   /**
    * 站点时钟（发布序号口径）：更正列表一次性全部公布，
@@ -156,6 +162,26 @@ export class MockArchiveSite {
   advanceClock(step = 6): number {
     this.clock = Math.min(this.totalPublished, this.clock + step);
     return this.clock;
+  }
+
+  /** 暂停数据接口 durationMs 毫秒（确定性制造“站点让采集等待”的窗口）。 */
+  pause(durationMs: number): number {
+    this.pausedUntil = Math.max(this.pausedUntil, Date.now() + durationMs);
+    return this.pausedUntil;
+  }
+
+  /** 提前解除暂停。 */
+  resume(): void {
+    this.pausedUntil = 0;
+  }
+
+  get isPaused(): boolean {
+    return Date.now() < this.pausedUntil;
+  }
+
+  /** 剩余暂停毫秒数。 */
+  get pausedRemainingMs(): number {
+    return Math.max(0, this.pausedUntil - Date.now());
   }
 
   /**
@@ -309,6 +335,57 @@ ${history}
         res.end(body);
       };
 
+      // 管理接口优先匹配：不受临时故障与暂停注入影响，保证离线验证始终可控
+      if (url.pathname === "/__admin/advance-clock") {
+        const step = Number(url.searchParams.get("step") ?? "6") || 6;
+        return send(
+          200,
+          JSON.stringify({ clock: this.advanceClock(step), totalPublished: this.totalPublished }),
+          "application/json",
+        );
+      }
+      if (url.pathname === "/__admin/reset-clock") {
+        this.clock = this.initialClock;
+        return send(
+          200,
+          JSON.stringify({ clock: this.clock, totalPublished: this.totalPublished }),
+          "application/json",
+        );
+      }
+      if (url.pathname === "/__admin/pause") {
+        const ms = Math.max(100, Number(url.searchParams.get("ms") ?? "8000") || 8000);
+        const until = this.pause(ms);
+        return send(
+          200,
+          JSON.stringify({ paused: true, until: new Date(until).toISOString(), remainingMs: this.pausedRemainingMs }),
+          "application/json",
+        );
+      }
+      if (url.pathname === "/__admin/resume") {
+        this.resume();
+        return send(200, JSON.stringify({ paused: false }), "application/json");
+      }
+      if (url.pathname === "/__admin/state") {
+        return send(
+          200,
+          JSON.stringify({
+            clock: this.clock,
+            totalPublished: this.totalPublished,
+            paused: this.isPaused,
+            expectedFinalState: this.expectedFinalState,
+          }),
+          "application/json",
+        );
+      }
+
+      // 暂停注入：数据接口统一 503 + Retry-After，采集端会等待后重试
+      if (this.isPaused) {
+        const retryAfter = Math.max(0.2, this.pausedRemainingMs / 1000).toFixed(2);
+        return send(503, `站点暂停服务，请 ${retryAfter} 秒后重试`, "text/plain", {
+          "Retry-After": retryAfter,
+        });
+      }
+
       const fault = this.transientFault();
       if (fault) {
         if (fault.status === 503) {
@@ -340,35 +417,6 @@ ${history}
         const html = this.renderDetail(m[1]);
         if (html === null) return send(404, "岩芯不存在", "text/plain");
         return send(200, html, "text/html");
-      }
-
-      // 管理接口（离线验证用）：推进/重置详情生效时钟
-      if (url.pathname === "/__admin/advance-clock") {
-        const step = Number(url.searchParams.get("step") ?? "6") || 6;
-        return send(
-          200,
-          JSON.stringify({ clock: this.advanceClock(step), totalPublished: this.totalPublished }),
-          "application/json",
-        );
-      }
-      if (url.pathname === "/__admin/reset-clock") {
-        this.clock = this.initialClock;
-        return send(
-          200,
-          JSON.stringify({ clock: this.clock, totalPublished: this.totalPublished }),
-          "application/json",
-        );
-      }
-      if (url.pathname === "/__admin/state") {
-        return send(
-          200,
-          JSON.stringify({
-            clock: this.clock,
-            totalPublished: this.totalPublished,
-            expectedFinalState: this.expectedFinalState,
-          }),
-          "application/json",
-        );
       }
 
       send(404, "未找到", "text/plain");

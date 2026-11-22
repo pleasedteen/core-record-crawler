@@ -21,24 +21,25 @@
 | 增量进度只计连续核实范围 | `last_contiguous_verified_seq` 仅在发布序号连续且全部核实时向前推进 |
 | 全量期间发布的更正能被增量接上 | 增量从第 1 页重扫更正列表，upsert 幂等，天然接住遗漏修订 |
 | 强制结束后续跑 | 全部断点与核实结果落 DuckDB；重启读取 `run_state` 继续，残留 `RUNNING` 标记为 `INTERRUPTED` |
+| 统一采集运行管理 | 启动（STARTUP）、定时（SCHEDULED）、手工（MANUAL）共用 `requestRun` 入口：同步占位保证并发只有一个入口能开始；手工 202 在运行记录落库后才返回；进度与结案在同一 DuckDB 事务提交 |
 | 统一限流 / 在途上限 | 目录、列表、详情、重试请求共用一个 `HttpFetcher`：滑动窗口速率 + 信号量在途上限 |
-| Retry-After 全局等待 | 收到等待时间后设置全局 `pausedUntil`，后续所有请求统一等待 |
+| Retry-After 全局等待 | 收到等待时间后设置全局 `pausedUntil`，后续所有请求统一等待；等待期间查询接口照常可用 |
 
 ## 2. 目录结构
 
 ```
 src/
   config.ts            全部可调参数（环境变量覆盖）
-  db.ts                DuckDB 存储层：建表、断点状态、核实/查询
-  api.ts               本地 HTTP 查询与进度接口
+  db.ts                DuckDB 存储层：建表/迁移、断点状态、事务性结案、核实/查询
+  api.ts               本地 HTTP 查询、进度接口与手工触发（统一运行入口）
   main.ts              入口（默认内嵌模拟站点 + 采集服务）
   collect/
     http.ts            统一 HTTP 客户端：限流、在途上限、退避重试、Retry-After
     parse.ts           目录/更正/详情解析
-    collector.ts       全量 + 增量 + 断点续传编排
-  mock/site.ts         离线模拟馆藏站点
+    collector.ts       统一运行管理 + 全量/增量编排 + 断点续传
+  mock/site.ts         离线模拟馆藏站点（含暂停注入 /__admin/pause、时钟推进）
   util/rng.ts          确定性随机工具
-scripts/verify.ts      离线端到端验证（含 SIGKILL 重启续跑）
+scripts/verify.ts      离线端到端验证（并发触发、结案前/后 SIGKILL 重启续跑）
 ```
 
 ## 3. 快速开始
@@ -63,9 +64,10 @@ EMBED_MOCK=0 MOCK_BASE_URL=http://127.0.0.1:9090 npm run serve
 npm run verify
 ```
 
-依赖安装后执行，约 20 秒输出可读结果（预算 80 秒内），覆盖：
-SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry-After、
-详情滞后→时钟推进→增量衔接、按编号查询与站点终态逐一比对。
+依赖安装后执行，约 70 秒输出可读结果（预算 115 秒内），覆盖：
+并发手工触发只放一个入口（202/409）、202 时运行记录已可查、等待站点期间查询照常、
+SIGKILL 结案前强制结束→重启续跑与结案后强杀零回退、重复链接合并、退避重试与 Retry-After、
+详情滞后→时钟推进→增量衔接、进度与结案同事务生效、按编号查询与站点终态逐一比对。
 全部通过打印 `🎉 全部验证通过`，退出码 0。
 
 ## 5. HTTP 接口说明
@@ -80,9 +82,9 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 | GET | `/identifications/:coreId` | 该岩芯全部修订及各自核实状态 |
 | GET | `/progress` | 采集进度（阶段、目录/更正游标、核实计数、连续核实序号、HTTP 统计） |
 | GET | `/stats` | 汇总：URL 去重数与尝试次数、各状态运行计数 |
-| GET | `/runs` / `/runs/:id` | 运行历史（含 `INTERRUPTED`/`COMPLETED`/`FAILED`） |
-| POST | `/collect/run-full` | 手工触发全量 |
-| POST | `/collect/catchup` | 手工触发一次增量追更正 |
+| GET | `/runs` / `/runs/:id` | 运行历史（含 `run_trigger`：STARTUP/SCHEDULED/MANUAL，及 `INTERRUPTED`/`COMPLETED`/`FAILED`） |
+| POST | `/collect/run-full` | 手工触发全量（统一运行入口；受理即落运行记录后返回 202，竞争中返回 409） |
+| POST | `/collect/catchup` | 手工触发一次增量追更正（同上，202 响应体含 `runId`） |
 
 ### `/cores/:coreId` 响应示例
 
@@ -108,6 +110,7 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 ### `/progress` 关键字段
 
 - `phase`：`IDLE` / `FULL` / `INCREMENTAL`
+- `trigger`：当前运行的触发来源 `STARTUP` / `SCHEDULED` / `MANUAL`（空闲为 `null`）
 - `catalog` / `corrections`：分页游标与总页数（断点）
 - `details`：`total` / `verified` / `pending`
 - `contiguousVerifiedSeq`：从上次进度起**连续核实**到的最大发布序号（增量进度口径）
@@ -134,8 +137,13 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 
 - `identifications`：每个 `(core_id, revision)` 一行，`PENDING`/`VERIFIED` 状态 + 核实内容 + 尝试次数
 - `fetch_urls`：已抓取 URL（去重与尝试次数证据）
-- `runs`：每次全量/增量运行记录（含中断标记）
+- `runs`：每次全量/增量运行记录（含中断标记与触发来源 `run_trigger`；旧库启动自动迁移补列）
 - `run_state`：单行断点表（目录/更正游标、连续核实序号、全量完成标志）
+
+运行结案时 `runs` 终态与 `run_state` 完成进度（首次全量的 `full_completed`、
+本轮增量的 `last_contiguous_verified_seq`）在**同一个 DuckDB 事务**内提交，
+两者同时生效；若进程在提交前被强杀，重启统一按 `RUNNING → INTERRUPTED` 恢复，
+已保存的核实结果原样沿用，不会出现进度与结案状态撕裂。
 
 > 说明：duckdb 1.4.x 的 Node 绑定无法序列化 BIGINT、不支持绑定 `null`、参数需展开传递，
 > 存储层已统一处理（序号列用 INTEGER、空值内联类型化 NULL、rest 参数展开），对上层透明。
