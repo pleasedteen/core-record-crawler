@@ -90,6 +90,22 @@ async function advanceClock(step = 8): Promise<number> {
   return data.clock;
 }
 
+/** 模拟站点会注入临时 503/500：对管理接口做有限重试，避免验证脚本被偶发故障打断。 */
+async function mockAdminJson(path: string): Promise<any> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${MOCK_PORT}${path}`);
+      if (resp.ok) return await resp.json();
+      lastErr = new Error(`HTTP ${resp.status}`);
+    } catch (err) {
+      lastErr = err;
+    }
+    await sleep(300 + attempt * 100);
+  }
+  throw new Error(`模拟站点管理接口 ${path} 持续失败: ${String(lastErr)}`);
+}
+
 /** 等待全量完成期间持续推进站点详情时钟，模拟时间流逝让滞后详情陆续生效。 */
 async function waitFullWithClock(): Promise<any> {
   const until = Date.now() + timeLeft() - 2_000;
@@ -162,10 +178,30 @@ async function main(): Promise<void> {
     (p) => p.details.total > 0 && (p.details.verified > 0 || p.details.pending > 0),
     "全量采集开始产生鉴定记录",
   );
+  // 等到进入详情复查轮且已有地址采集落库（DONE），再强杀，
+  // 以便验证“续跑原轮、已采集地址本轮不再请求”。
+  await waitProgress(
+    (p) =>
+      p.review?.openRoundId !== null &&
+      p.review?.openRoundId !== undefined &&
+      (p.review?.coresDone ?? 0) > 0,
+    "详情复查轮开始并产生已采集地址",
+  );
   const mid = (await api<any>("/progress")).body;
+  const midStats = (await api<any>("/stats")).body;
+  const openRoundBefore = midStats.reviewRounds.find((r: any) => r.status === "OPEN");
+  const doneEntriesBefore = (midStats.openReviewEntries as any[]).filter(
+    (e) => e.status === "DONE",
+  );
   console.log(
     `[verify] 全量进行中：已登记 ${mid.details.total} 条，已核实 ${mid.details.verified} 条，` +
-      `目录 ${mid.catalog.cursor}/${mid.catalog.totalPages}，更正 ${mid.corrections.cursor}/${mid.corrections.totalPages}`,
+      `目录 ${mid.catalog.cursor}/${mid.catalog.totalPages}，更正 ${mid.corrections.cursor}/${mid.corrections.totalPages}；` +
+      `复查轮 #${mid.review.openRoundId} 已完成 ${mid.review.coresDone}/${mid.review.coresTotal} 个地址`,
+  );
+  check(
+    "强杀前复查轮已落库且存在已采集（DONE）地址",
+    !!openRoundBefore && doneEntriesBefore.length > 0,
+    `OPEN 轮 #${openRoundBefore?.id}，DONE 条目 ${doneEntriesBefore.length} 条`,
   );
 
   // 强制结束（模拟 kill -9 / 掉电）：杀整个进程组
@@ -177,6 +213,30 @@ async function main(): Promise<void> {
   // ---- 阶段 2：重启续跑，沿用已保存核实结果（期间推进站点时钟让滞后详情生效）----
   startService();
   await waitForHealth();
+
+  // 重启后尽快轮询，捕捉“继续原轮”的瞬间：
+  //  - 同一个复查轮 id 被复用且 restarts 增加；
+  //  - resumeSkips > 0 表示上轮已 DONE 的地址本轮未再请求。
+  let resumeObserved: any = null;
+  const resumeDeadline = Date.now() + 25_000;
+  while (Date.now() < resumeDeadline) {
+    const snap = (await api<any>("/progress")).body;
+    const r = snap.review;
+    if (r && r.openRoundId === openRoundBefore.id && r.restarts >= 1) {
+      resumeObserved = snap;
+      break;
+    }
+    if (snap.fullCompleted === true) break;
+    await sleep(40);
+  }
+  check(
+    "强杀后续跑同一个复查轮（轮次 id 复用、restarts 增加）",
+    resumeObserved !== null,
+    resumeObserved
+      ? `原轮 #${openRoundBefore.id} 被继续，restarts=${resumeObserved.review.restarts}`
+      : `原轮 #${openRoundBefore.id}（轮询窗口内已结束，改由落库轮次记录判定）`,
+  );
+
   const progress2 = await waitFullWithClock();
   check(
     "重启后续跑并完成全量",
@@ -187,6 +247,30 @@ async function main(): Promise<void> {
     "连续核实进度覆盖全部已发布序号",
     progress2.contiguousVerifiedSeq === progress2.corrections.totalPublished,
     `连续核实序号 ${progress2.contiguousVerifiedSeq} / 已发布 ${progress2.corrections.totalPublished}`,
+  );
+
+  // 落库的复查轮记录：原轮应带 restarts>=1；OPEN 轮条目必须已清空（额外存储只随待核实地址增长）
+  const statsAfter = (await api<any>("/stats")).body;
+  const resumedRound = (statsAfter.reviewRounds as any[]).find((r) => r.id === openRoundBefore.id);
+  check(
+    "续跑原轮在落库记录中可追溯（restarts≥1 且轮次已关闭）",
+    !!resumedRound && resumedRound.restarts >= 1 && resumedRound.status === "CLOSED",
+    resumedRound
+      ? `轮 #${resumedRound.id} status=${resumedRound.status} restarts=${resumedRound.restarts}`
+      : "未找到原轮记录",
+  );
+  // 持久化的跳过计数（竞态无关）：强杀前已 DONE 的地址，续跑本轮都不应再请求。
+  check(
+    "已保存核实结果的地址续跑本轮不再请求（resumeDoneSkips ≥ 强杀前 DONE 地址数）",
+    !!resumedRound && resumedRound.resumeDoneSkips >= doneEntriesBefore.length,
+    resumedRound
+      ? `落库跳过 DONE 地址 ${resumedRound.resumeDoneSkips} 个（强杀前已 DONE ${doneEntriesBefore.length} 个）`
+      : "未找到原轮记录",
+  );
+  check(
+    "复查轮结束后逐地址条目已清空（续跑额外数据量只随待核实条目增长）",
+    Array.isArray(statsAfter.openReviewEntries) && statsAfter.openReviewEntries.length === 0,
+    `残留 OPEN 轮条目 ${statsAfter.openReviewEntries?.length ?? 0} 条`,
   );
 
   // ---- 阶段 3：去重、重试、Retry-After 证据 ----
@@ -210,11 +294,62 @@ async function main(): Promise<void> {
     `总请求 ${progress2.http.requests}，重试 ${progress2.http.retried}，Retry-After 等待 ${progress2.http.retryAfterWaits}`,
   );
 
+  // 每轮对同一详情地址至多发起一次“逻辑详情采集”：
+  // 轮次的逻辑采集数不得超过该轮出现过的待核实地址总数（DONE 后本轮不补发）。
+  const rounds = stats.reviewRounds as any[];
+  const violatingRounds = rounds.filter(
+    (r) => r.status === "CLOSED" && r.detailRequests > r.maxCoresSeen,
+  );
+  check(
+    "每轮复查同址待核实修订只发起一次详情采集（逻辑采集数 ≤ 轮次地址数）",
+    rounds.length > 0 && violatingRounds.length === 0,
+    rounds.length
+      ? `共 ${rounds.length} 轮，违规轮 ${violatingRounds.length} 个；` +
+          rounds
+            .map((r) => `#${r.id}[${r.phase}] 采集${r.detailRequests}/地址${r.maxCoresSeen}`)
+            .join("，")
+      : "无复查轮记录",
+  );
+  check(
+    "同址多个待核实修订共享同一次详情采集（sharedDetailResponses>0）",
+    (progress2.review?.sharedDetailResponses ?? 0) > 0,
+    `共享命中 ${progress2.review?.sharedDetailResponses ?? 0} 次（模拟目录含同址多修订岩芯）`,
+  );
+
+  // 目录中同一详情地址挂多个修订时，每个修订都必须登记（旧逻辑按 URL 去重会漏登）。
+  // 鉴定记录总数应等于站点全部已发布修订数，且同一 (岩芯, 修订) 只有一条记录。
+  const mockState = (await mockAdminJson("/__admin/state")) as any;
+  const allExpected = mockState.expectedFinalState as Array<{
+    coreId: string;
+    latestRevision: number;
+    totalRevisions: number;
+  }>;
+  const expectedRevisionTotal = allExpected.reduce((sum, e) => sum + e.totalRevisions, 0);
+  check(
+    "同一详情地址挂多个修订时每个修订都登记（鉴定总数=站点发布修订总数）",
+    stats.identifications.total === expectedRevisionTotal,
+    `本地鉴定 ${stats.identifications.total} 条 / 站点发布修订 ${expectedRevisionTotal} 条`,
+  );
+  const multiRevCores = allExpected.filter((e: any) => e.totalRevisions > 1);
+  let multiRegOk = 0;
+  for (const exp of multiRevCores) {
+    const { body: idents } = await api<any>(`/identifications/${exp.coreId}`);
+    const revisions = (idents.revisions ?? []) as any[];
+    const uniqueRevs = new Set(revisions.map((r) => r.revision));
+    if (revisions.length === exp.totalRevisions && uniqueRevs.size === revisions.length) {
+      multiRegOk += 1;
+    }
+  }
+  check(
+    "同一修订反复出现只留一条鉴定记录（同址多修订岩芯各自修订唯一登记）",
+    multiRegOk === multiRevCores.length,
+    `${multiRegOk}/${multiRevCores.length} 个多修订岩芯登记正确`,
+  );
+
   // ---- 阶段 4：制造“详情滞后”，增量追更正衔接 ----
   // 模拟站点时钟推进：让可能存在的滞后详情生效；同时触发一次增量
   const beforeCatchup = (await api<any>("/progress")).body;
-  const admin = await fetch(`http://127.0.0.1:${MOCK_PORT}/__admin/advance-clock?step=100`);
-  const clock = (await admin.json()) as { clock: number };
+  const clock = (await mockAdminJson("/__admin/advance-clock?step=100")) as { clock: number };
   console.log(`[verify] 推进模拟站点详情生效时钟 → ${clock.clock}`);
   await api("/collect/catchup", { method: "POST" });
   const after = await waitProgress(
@@ -234,12 +369,7 @@ async function main(): Promise<void> {
   );
 
   // ---- 阶段 5：按岩芯编号查询，逐一比对模拟站点期望终态 ----
-  const state = (await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__admin/state`)).json()) as any;
-  const expected = state.expectedFinalState as Array<{
-    coreId: string;
-    latestRevision: number;
-    totalRevisions: number;
-  }>;
+  const expected = allExpected;
   let matched = 0;
   let multiRevisionOk = 0;
   for (const exp of expected) {

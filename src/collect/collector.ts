@@ -12,7 +12,7 @@
  * 已保存的核实结果原样沿用。
  */
 import { config } from "../config.js";
-import { Database, IdentificationRow } from "../db.js";
+import { Database, ReviewPhase } from "../db.js";
 import { HttpFetcher } from "./http.js";
 import { parseCatalog, parseCorrections, parseDetail, CatalogLink, CorrectionItem } from "./parse.js";
 import { sleep } from "../util/rng.js";
@@ -42,6 +42,18 @@ export interface ProgressSnapshot {
   fullCompletedAt: string | null;
   lastCatchupAt: string | null;
   http: { requests: number; retried: number; retryAfterWaits: number };
+  /** 当前复查轮（强杀续跑同一轮）及逐地址采集进度。 */
+  review: {
+    openRoundId: number | null;
+    phase: ReviewPhase | null;
+    coresTotal: number;
+    coresDone: number;
+    coresFailed: number;
+    restarts: number;
+    resumeDoneSkips: number;
+    resumeSkips: number;
+    sharedDetailResponses: number;
+  };
   lastError: string | null;
   updatedAt: string;
 }
@@ -54,6 +66,10 @@ export class Collector {
   private totalPublished: number | null = null;
   private stopRequested = false;
   private catchupTimer: NodeJS.Timeout | null = null;
+  /** 进程内统计：续跑原轮时跳过的、上轮已采集（DONE）的地址数。 */
+  private resumeSkips = 0;
+  /** 进程内统计：同址多个待核实修订共享同一次详情采集的命中次数。 */
+  private sharedDetailResponses = 0;
 
   constructor(
     private db: Database,
@@ -110,14 +126,15 @@ export class Collector {
 
       await this.crawlCatalog();
       await this.crawlCorrections();
-      // 详情可能滞后：多轮复查直到全部核实（每轮之间站点时钟会推进或重试退避）
+      // 详情可能滞后：一轮复查中每个待核实详情地址只采集一次；
+      // 详情仍旧的修订保留 PENDING，多轮复查直到全部核实（轮间站点时钟会推进或重试退避）。
       let pass = 0;
       while (!this.stopRequested) {
         pass += 1;
         const pendingBefore = await this.db.listPending();
         if (pendingBefore.length === 0) break;
         this.log(`详情核实第 ${pass} 轮，待核实 ${pendingBefore.length} 条`);
-        await this.verifyPending(pendingBefore);
+        await this.runReviewSweep("FULL");
         const still = await this.db.listPending();
         if (still.length === 0) break;
         this.log(`仍有 ${still.length} 条详情滞后，等待站点详情更新后复查`);
@@ -159,11 +176,17 @@ export class Collector {
     const state = await this.db.getRunState();
     let page = state.catalog_page_cursor + 1;
     let totalPages = state.catalog_total_pages;
-    const seen = new Set<string>();
+    // 同一详情地址可挂多个修订：按「地址 + 修订号」去重，
+    // 完全重复的链接合并，同地址的不同修订各自登记，不再漏登。
+    const seenRevisions = new Set<string>();
+    const seenUrls = new Set<string>();
     let dupCount = 0;
 
     while (!this.stopRequested) {
       const url = this.buildUrl(`/catalog?page=${page}`);
+      // 已持久化总页数时先做边界判断：续跑时内存 seen 已丢失，
+      // 不能依赖 URL 去重表决定结束，否则会越过末页请求不存在的页（404 不可重试）。
+      if (totalPages !== null && page > totalPages) break;
       if (await this.db.hasFetchedUrl(url)) {
         page += 1;
         if (totalPages !== null && page > totalPages) break;
@@ -174,11 +197,11 @@ export class Collector {
       totalPages = parsed.totalPages;
 
       for (const link of parsed.links) {
-        if (seen.has(link.detailUrl)) {
-          dupCount += 1;
-          continue; // 同一详情地址的重复链接合并
-        }
-        seen.add(link.detailUrl);
+        if (seenUrls.has(link.detailUrl)) dupCount += 1; // 同一详情地址的重复链接合并统计
+        seenUrls.add(link.detailUrl);
+        const revisionKey = `${link.detailUrl}#r${link.revision}`;
+        if (seenRevisions.has(revisionKey)) continue; // 完全相同的「地址+修订」重复条目
+        seenRevisions.add(revisionKey);
         await this.registerCatalogLink(link);
       }
       await this.db.recordUrl(url, "CATALOG", "DONE", null);
@@ -190,7 +213,9 @@ export class Collector {
       page += 1;
       if (page > totalPages) break;
     }
-    this.log(`目录抓取完成：去重后详情链接 ${seen.size} 个，重复链接合并 ${dupCount} 条`);
+    this.log(
+      `目录抓取完成：去重后详情链接 ${seenUrls.size} 个、修订条目 ${seenRevisions.size} 条，重复链接合并 ${dupCount} 条`,
+    );
   }
 
   private async registerCatalogLink(link: CatalogLink): Promise<void> {
@@ -222,6 +247,8 @@ export class Collector {
 
     while (!this.stopRequested) {
       const url = this.buildUrl(`/corrections?page=${page}`);
+      // 非重扫模式下用持久化总页数兜底边界，避免续跑越过末页触发 404。
+      if (!rescan && totalPages !== null && page > totalPages) break;
       const res = await this.fetcher.get(url);
       const parsed = parseCorrections(res.body);
       totalPages = parsed.totalPages;
@@ -230,11 +257,13 @@ export class Collector {
       for (const item of parsed.items) await this.registerCorrection(item);
       const maxSeq = parsed.items.reduce((m, it) => Math.max(m, it.publishedSeq), newestSeq);
       newestSeq = maxSeq;
+      this.totalPublished = parsed.totalPublished;
 
       await this.db.recordUrl(url, "CORRECTIONS", "DONE", null);
       await this.db.saveRunState({
         correction_page_cursor: page,
         correction_total_pages: totalPages,
+        total_published: parsed.totalPublished,
       });
       this.log(
         `${rescan ? "重扫" : "全量"}更正列表第 ${page}/${totalPages} 页完成` +
@@ -259,53 +288,101 @@ export class Collector {
     }
   }
 
-  // ---------------- 详情核实 ----------------
+  // ---------------- 详情核实（按复查轮组织） ----------------
 
   /**
-   * 并发核实待核实修订。
-   * 同一详情地址的多个待核实修订共享同一次响应：
-   * 同一待核实修订只合并采集一次，后续修订仍会触发复查（按 revision 各自判定）。
+   * 执行一次复查轮（一次扫描）。
+   *
+   * 不变量：
+   *  - 每个有待核实修订的详情地址在本轮只发起一次详情采集（同址多修订共享同一份响应）；
+   *  - 详情仍旧（缺少待核实修订）时该地址本轮标记 DONE 但不再补发，修订留待后续复查；
+   *  - 临时失败照常重试（HTTP 层退避），仍失败则保留 FAILED 条目，后续轮次再抓；
+   *  - 轮次与逐地址状态全部落库：强杀后重启恢复同一个 OPEN 轮次继续，
+   *    已 DONE 的地址本轮不再请求。
    */
-  private async verifyPending(pending: IdentificationRow[]): Promise<void> {
-    const inFlight = new Map<string, Promise<void>>();
+  private async runReviewSweep(phase: ReviewPhase): Promise<void> {
+    const runId = this.runId;
+    if (runId === null) throw new Error("复查轮必须在运行上下文中执行");
+
+    const pendingCoreIds = await this.db.listPendingCoreIds();
+    if (pendingCoreIds.length === 0) return;
+
+    // 复用未结束的同阶段轮次（强杀后续跑原轮）；否则新建一轮。
+    let round = await this.db.getOpenReviewRound(phase);
+    if (round) {
+      if (round.run_id !== runId) await this.db.reattachReviewRound(round.id, runId);
+      // 运行中新登记的同址修订：补登条目；已是 DONE 的地址不会回退，本轮不再请求。
+      for (const coreId of pendingCoreIds) await this.db.ensureReviewCoreEntry(round.id, coreId);
+      // 续跑核算：轮次内处于 DONE 的地址即“上轮已采集、本轮不再请求”的地址。
+      const counts = await this.db.countReviewCoreEntries(round.id);
+      if (counts.done > 0) {
+        this.resumeSkips += counts.done;
+        await this.db.addResumeDoneSkips(round.id, counts.done);
+        this.log(
+          `继续复查轮 #${round.id}（已重启 ${round.restarts} 次，` +
+            `跳过已采集 DONE 地址 ${counts.done} 个，剩余待采集 ${counts.failed + counts.pending} 个）`,
+        );
+      } else {
+        this.log(`继续复查轮 #${round.id}（已重启 ${round.restarts} 次）`);
+      }
+    } else {
+      const id = await this.db.createReviewRound(phase, runId, pendingCoreIds);
+      round = await this.db.getReviewRound(id);
+      this.log(`新建复查轮 #${id}：待核实详情地址 ${pendingCoreIds.length} 个，每地址本轮只采集一次`);
+    }
+    const roundId = round!.id;
+
+    // 仅取出本轮尚未成功采集的地址（DONE 不返回，续跑时天然跳过）。
+    const entries = await this.db.listReviewCoreEntries(roundId);
+
     const workers = Math.max(1, config.maxInflight);
     let idx = 0;
-
     const worker = async (): Promise<void> => {
       for (;;) {
         const myIdx = idx++;
-        if (myIdx >= pending.length || this.stopRequested) return;
-        const row = pending[myIdx];
-        const url = this.buildUrl(`/core/${row.core_id}`);
-
-        let job = inFlight.get(url);
-        if (!job) {
-          job = this.fetchAndVerify(url, row.core_id);
-          inFlight.set(url, job);
-          try {
-            await job;
-          } finally {
-            inFlight.delete(url);
-          }
-        } else {
-          // 同一详情地址已有在途请求：等待其完成后再依据各自修订复查
-          await job.catch(() => undefined);
-          await this.evaluateOne(row);
-        }
+        if (myIdx >= entries.length || this.stopRequested) return;
+        const entry = entries[myIdx];
+        await this.fetchAndVerifyOne(roundId, entry.core_id);
       }
     };
-
     await Promise.all(Array.from({ length: workers }, () => worker()));
+
+    if (this.stopRequested) {
+      // 保持轮次 OPEN：重启后继续原轮，已保存 DONE 的地址本轮不再请求。
+      this.log(`复查轮 #${roundId} 因停止信号暂停，轮次状态已保存，重启后续跑原轮`);
+      return;
+    }
+
+    const finalRound = await this.db.getReviewRound(roundId);
+    const pendingAfter = await this.db.listPendingCoreIds();
+    this.log(
+      `复查轮 #${roundId} 结束：地址 ${finalRound?.cores_total ?? entries.length} 个，` +
+        `成功采集 ${finalRound?.cores_done ?? 0} 个、临时失败 ${finalRound?.cores_failed ?? 0} 个，` +
+        `仍待核实修订覆盖地址 ${pendingAfter.length} 个（留待后续复查）`,
+    );
+    await this.db.closeReviewRound(roundId);
   }
 
-  /** 拉取一次详情，并对该岩芯所有 PENDING 修订逐一判定。 */
-  private async fetchAndVerify(url: string, coreId: string): Promise<void> {
+  /**
+   * 拉取某岩芯详情一次，并对该岩芯当前所有 PENDING 修订逐一判定。
+   * 成功（含详情仍旧）→ 轮次条目 DONE，本轮不再补发；
+   * 临时失败 → 轮次条目 FAILED，HTTP 层已做指数退避，后续轮次照常重试。
+   */
+  private async fetchAndVerifyOne(roundId: number, coreId: string): Promise<void> {
+    const url = this.buildUrl(`/core/${coreId}`);
+    const entry = await this.db.getReviewCoreEntry(roundId, coreId);
+    if (entry?.status === "DONE") return; // 双保险：同址本轮绝不重复采集
+
+    const pendingBefore = await this.db.listPending();
+    const pendingRows = pendingBefore.filter((r) => r.core_id === coreId);
+    if (pendingRows.length > 1) this.sharedDetailResponses += pendingRows.length - 1;
+
     try {
+      await this.db.incrementDetailRequests(roundId, coreId);
       const res = await this.fetcher.get(url);
       const detail = parseDetail(res.body, coreId);
       await this.db.recordUrl(url, "DETAIL", "DONE", null);
       const byRevision = new Map(detail.history.map((h) => [h.revision, h]));
-      const pendingRows = (await this.db.listPending()).filter((r) => r.core_id === coreId);
       for (const row of pendingRows) {
         const match = byRevision.get(row.revision);
         if (match) {
@@ -314,30 +391,26 @@ export class Collector {
           this.log(
             `核实通过：${coreId} r${row.revision}（岩性 ${match.classification}，核实人 ${match.verifier}）`,
           );
-        } else if (detail.currentRevision < row.revision) {
-          // 列表已公布更正、详情尚未生效 → 保持 PENDING，后续复查
-          await this.db.markStillStale(coreId, row.revision, detail.currentRevision);
         } else {
-          // 当前修订号更大但历史中缺该条（异常数据）：记录并留待复查
+          // 列表已公布但旧响应里缺少该修订（详情仍旧/尚未生效）：
+          // 保持 PENDING，本轮不再补发，留给后续复查轮。
           await this.db.markStillStale(coreId, row.revision, detail.currentRevision);
         }
       }
+      // 无论核实通过还是仍旧：该地址本轮采集已完成，不再重复请求。
+      await this.db.markReviewCoreDone(
+        roundId,
+        coreId,
+        detail.currentRevision,
+        detail.currentPublishedSeq,
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await this.db.recordUrl(url, "DETAIL", "FAILED", message).catch(() => undefined);
-      const pendingRows = (await this.db.listPending()).filter((r) => r.core_id === coreId);
       for (const row of pendingRows) await this.db.recordAttempt(row.core_id, row.revision, message);
+      await this.db.markReviewCoreFailed(roundId, coreId, message).catch(() => undefined);
       this.lastError = message;
-      this.log(`详情抓取失败 ${coreId}：${message}（将在后续轮次重试）`);
-    }
-  }
-
-  /** 复用在途详情响应后的二次复查入口（同一 URL 不重复发请求的场景之外兜底）。 */
-  private async evaluateOne(row: IdentificationRow): Promise<void> {
-    const fresh = await this.db.getIdentification(row.core_id, row.revision);
-    if (fresh && fresh.status === "PENDING") {
-      const url = this.buildUrl(`/core/${row.core_id}`);
-      await this.fetchAndVerify(url, row.core_id);
+      this.log(`详情抓取失败 ${coreId}：${message}（临时失败，后续轮次照常重试）`);
     }
   }
 
@@ -367,14 +440,15 @@ export class Collector {
       // 重扫更正列表：全量期间发布的更正也会在这里登记并接上
       const { newestSeq } = await this.crawlCorrections(true);
 
-      // 复查全部待核实修订（含详情滞后遗留 + 新发布修订）
+      // 复查全部待核实修订（含详情滞后遗留 + 新发布修订）：
+      // 每轮对同址待核实修订只发起一次详情采集，最多三轮扫描。
       let pass = 0;
       while (!this.stopRequested && pass < 3) {
         pass += 1;
         const pending = await this.db.listPending();
         if (pending.length === 0) break;
         this.log(`增量复查第 ${pass} 轮，待核实 ${pending.length} 条`);
-        await this.verifyPending(pending);
+        await this.runReviewSweep("INCREMENTAL");
       }
 
       const contiguous = await this.recomputeContiguous(baseline);
@@ -424,6 +498,9 @@ export class Collector {
   async snapshot(): Promise<ProgressSnapshot> {
     const state = await this.db.getRunState();
     const counts = await this.db.countByStatus();
+    const openRounds = await this.db.listOpenReviewRounds();
+    // 同一时刻只可能有一个阶段在跑；若残留多个 OPEN 轮，取最新的一个展示。
+    const openRound = openRounds[openRounds.length - 1] ?? null;
     return {
       phase: this.phase,
       running: this.running,
@@ -439,7 +516,8 @@ export class Collector {
         cursor: Number(state.correction_page_cursor),
         totalPages:
           state.correction_total_pages === null ? null : Number(state.correction_total_pages),
-        totalPublished: this.totalPublished,
+        // 优先用进程内最新值；强杀重启后内存丢失则回落到落库值。
+        totalPublished: this.totalPublished ?? state.total_published,
       },
       details: {
         total: counts.verified + counts.pending,
@@ -451,6 +529,17 @@ export class Collector {
       fullCompletedAt: state.full_completed_at,
       lastCatchupAt: state.last_catchup_at,
       http: { ...this.fetcher.stats },
+      review: {
+        openRoundId: openRound ? openRound.id : null,
+        phase: openRound ? openRound.phase : null,
+        coresTotal: openRound ? openRound.cores_total : 0,
+        coresDone: openRound ? openRound.cores_done : 0,
+        coresFailed: openRound ? openRound.cores_failed : 0,
+        restarts: openRound ? openRound.restarts : 0,
+        resumeDoneSkips: openRound ? openRound.resume_done_skips : 0,
+        resumeSkips: this.resumeSkips,
+        sharedDetailResponses: this.sharedDetailResponses,
+      },
       lastError: this.lastError,
       updatedAt: new Date().toISOString(),
     };

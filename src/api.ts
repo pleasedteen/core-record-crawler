@@ -140,7 +140,7 @@ export function createApiServer(db: Database, collector: Collector): http.Server
         return row ? json(res, 200, row) : json(res, 404, { error: "运行记录不存在" });
       }
 
-      // 汇总统计（验证用：URL 去重、重试、核实计数）
+      // 汇总统计（验证用：URL 去重、重试、核实计数、复查轮续跑）
       if (p === "/stats" && req.method === "GET") {
         const urlKinds = await db.all<{ kind: string; n: number; attempts_sum: number }>(
           `SELECT kind,
@@ -150,6 +150,17 @@ export function createApiServer(db: Database, collector: Collector): http.Server
         );
         const runStatus = await db.all<{ status: string; n: number }>(
           `SELECT status, CAST(COUNT(*) AS INTEGER) AS n FROM runs GROUP BY status ORDER BY status`,
+        );
+        const openRounds = await db.listOpenReviewRounds();
+        const roundRows = await db.all<import("./db.js").ReviewRoundRow>(
+          `SELECT * FROM review_rounds ORDER BY id DESC LIMIT 20`,
+        );
+        const openEntries = await db.all<{ core_id: string; status: string }>(
+          openRounds.length > 0
+            ? `SELECT core_id, status FROM review_core_entries
+                WHERE round_id IN (${openRounds.map(() => "?").join(",")}) ORDER BY core_id`
+            : `SELECT core_id, status FROM review_core_entries WHERE 1 = 0`,
+          openRounds.map((r) => r.id),
         );
         const counts = await db.countByStatus();
         return json(res, 200, {
@@ -164,6 +175,19 @@ export function createApiServer(db: Database, collector: Collector): http.Server
             totalAttempts: Number(r.attempts_sum),
           })),
           runs: runStatus.map((r) => ({ status: r.status, count: Number(r.n) })),
+          reviewRounds: roundRows.map((r) => ({
+            id: r.id,
+            phase: r.phase,
+            status: r.status,
+            restarts: r.restarts,
+            coresTotal: r.cores_total,
+            maxCoresSeen: r.max_cores_seen,
+            coresDone: r.cores_done,
+            coresFailed: r.cores_failed,
+            detailRequests: r.detail_requests,
+            resumeDoneSkips: r.resume_done_skips,
+          })),
+          openReviewEntries: openEntries.map((e) => ({ coreId: e.core_id, status: e.status })),
         });
       }
 

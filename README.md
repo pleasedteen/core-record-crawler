@@ -8,16 +8,21 @@
 
 | 需求 | 实现方式 |
 | --- | --- |
-| 分页 HTML 馆藏目录 | `GET /catalog?page=N`，页头标注总页数，条目内含重复链接 |
+| 分页 HTML 馆藏目录 | `GET /catalog?page=N`，页头标注总页数，条目内含重复链接，同一详情地址可挂多个修订 |
 | 按发布顺序翻页的 JSON 更正列表 | `GET /corrections?page=N`，含全局发布序号 `publishedSeq` |
 | 岩芯详情页 | `GET /core/:id`，同一岩芯多个修订共用同一地址，含「当前生效修订 + 修订历史」 |
+| 同址多修订逐个登记 | 目录按「详情地址 + 修订号」去重：完全重复的链接合并，同地址不同修订各自 upsert；`identifications` 主键 `(core_id, revision)` 保证同一修订反复出现只留一条 |
 | 当年鉴定当天更正 | 数据集内含相同日期、不同 revision 的修订 |
 | 列表已更正、详情暂时仍旧修订 | 站点「详情生效时钟」控制，列表先公布、详情滞后生效；采集端保留 `PENDING` 并复查 |
 | 重复链接 | 目录刻意输出重复 `<li>`，采集端按详情 URL 去重合并 |
 | 临时拒绝 | 站点随机返回 503（带 `Retry-After`）与 500；采集端指数退避重试 |
-| 同一待核实修订只合并采集一次 | `identifications` 以 `(core_id, revision)` 为主键；同 URL 在途请求共享响应 |
-| 后续修订触发复查 | 每个 revision 独立判定，新修订登记为 `PENDING` 并重新拉取详情 |
-| 核实后立即可查 | 标记 `VERIFIED` 后 `/cores/:id` 立刻返回 |
+| 每轮同址只采集一次 | 复查轮（`review_rounds`/`review_core_entries`）逐地址登记：一轮内每个待核实详情地址只发起一次逻辑详情采集，同址多修订共享同一份响应 |
+| 详情仍旧不补发 | 详情响应缺少待核实修订时该地址本轮标记 `DONE`、修订保持 `PENDING`，本轮不再请求，留给后续复查轮 |
+| 临时失败照常重试 | HTTP 层指数退避；轮次条目记 `FAILED`，后续轮次继续抓；`detail_requests` 按地址去重计数，重试不重复计数 |
+| 后续修订触发复查 | 每个 revision 独立判定，新修订登记为 `PENDING` 并在下一复查轮拉取详情 |
+| 强杀后续跑原轮 | 复查轮状态落库：重启复用同一 `OPEN` 轮次，已 `DONE` 地址本轮不再请求（`resume_done_skips` 留证），旧响应缺少的修订与后来公布的同址修订留给后续复查 |
+| 核实后立即可查 | 每条修订核实即单行提交，`VERIFIED` 后 `/cores/:id` 立刻返回；批量核实期间其他岩芯照常可查 |
+| 续跑额外存储有界 | 逐地址条目仅在轮次进行中存在、轮末删除，数量只随本轮待核实地址增长；不保存响应体或逐次尝试明细 |
 | 增量进度只计连续核实范围 | `last_contiguous_verified_seq` 仅在发布序号连续且全部核实时向前推进 |
 | 全量期间发布的更正能被增量接上 | 增量从第 1 页重扫更正列表，upsert 幂等，天然接住遗漏修订 |
 | 强制结束后续跑 | 全部断点与核实结果落 DuckDB；重启读取 `run_state` 继续，残留 `RUNNING` 标记为 `INTERRUPTED` |
@@ -132,10 +137,12 @@ SIGKILL 强制结束→重启续跑、重复链接合并、退避重试与 Retry
 
 ## 7. 存储模型（DuckDB）
 
-- `identifications`：每个 `(core_id, revision)` 一行，`PENDING`/`VERIFIED` 状态 + 核实内容 + 尝试次数
+- `identifications`：每个 `(core_id, revision)` 一行，`PENDING`/`VERIFIED` 状态 + 核实内容 + 尝试次数；同一修订反复出现也只保留一行
 - `fetch_urls`：已抓取 URL（去重与尝试次数证据）
 - `runs`：每次全量/增量运行记录（含中断标记）
-- `run_state`：单行断点表（目录/更正游标、连续核实序号、全量完成标志）
+- `run_state`：单行断点表（目录/更正游标、已发布总数、连续核实序号、全量完成标志）
+- `review_rounds`：复查轮汇总（阶段、重启次数、地址总数、逻辑详情采集数、续跑跳过的 DONE 地址数）
+- `review_core_entries`：轮次内按详情地址的采集状态（`PENDING`/`DONE`/`FAILED`）；轮末删除，行数只随本轮待核实地址增长
 
 > 说明：duckdb 1.4.x 的 Node 绑定无法序列化 BIGINT、不支持绑定 `null`、参数需展开传递，
 > 存储层已统一处理（序号列用 INTEGER、空值内联类型化 NULL、rest 参数展开），对上层透明。

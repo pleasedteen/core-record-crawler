@@ -41,6 +41,7 @@ export interface RunStateRow {
   catalog_total_pages: number | null;
   correction_page_cursor: number;
   correction_total_pages: number | null;
+  total_published: number | null;
   last_contiguous_verified_seq: number;
   full_completed: boolean;
   full_completed_at: string | null;
@@ -64,6 +65,37 @@ export interface RunRow {
   details_failed: number;
   contiguous_verified_seq: number;
   last_error: string | null;
+}
+
+export type ReviewPhase = "FULL" | "INCREMENTAL";
+export type ReviewEntryStatus = "PENDING" | "DONE" | "FAILED";
+
+export interface ReviewRoundRow {
+  id: number;
+  phase: ReviewPhase;
+  run_id: number | null;
+  status: "OPEN" | "CLOSED";
+  restarts: number;
+  cores_total: number;
+  max_cores_seen: number;
+  cores_done: number;
+  cores_failed: number;
+  detail_requests: number;
+  resume_done_skips: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReviewCoreEntryRow {
+  round_id: number;
+  core_id: string;
+  status: ReviewEntryStatus;
+  logical_fetched: boolean;
+  shown_revision: number | null;
+  shown_published_seq: number | null;
+  attempts: number;
+  last_error: string | null;
+  updated_at: string;
 }
 
 /** 极简异步互斥锁，保证同一连接上的语句顺序执行。 */
@@ -133,11 +165,47 @@ CREATE TABLE IF NOT EXISTS run_state (
   catalog_total_pages           INTEGER,
   correction_page_cursor        INTEGER NOT NULL DEFAULT 0,
   correction_total_pages        INTEGER,
+  total_published               INTEGER,
   last_contiguous_verified_seq  INTEGER NOT NULL DEFAULT 0,
   full_completed                BOOLEAN NOT NULL DEFAULT false,
   full_completed_at             TIMESTAMP,
   last_catchup_at               TIMESTAMP,
   updated_at                    TIMESTAMP NOT NULL
+);
+
+-- 复查轮：每轮对每个待核实详情地址只采集一次。
+-- 轮次状态落库：进程被强杀后重启，凭 OPEN 轮次继续原轮，已采集（DONE）的地址本轮不再请求。
+CREATE SEQUENCE IF NOT EXISTS review_rounds_id_seq START 1;
+CREATE TABLE IF NOT EXISTS review_rounds (
+  id            INTEGER NOT NULL PRIMARY KEY
+                  DEFAULT CAST(nextval('review_rounds_id_seq') AS INTEGER),
+  phase         VARCHAR   NOT NULL,
+  run_id        INTEGER,
+  status        VARCHAR   NOT NULL DEFAULT 'OPEN',
+  restarts      INTEGER   NOT NULL DEFAULT 0,
+  cores_total   INTEGER   NOT NULL DEFAULT 0,
+  max_cores_seen INTEGER  NOT NULL DEFAULT 0,
+  cores_done    INTEGER   NOT NULL DEFAULT 0,
+  cores_failed  INTEGER   NOT NULL DEFAULT 0,
+  detail_requests INTEGER NOT NULL DEFAULT 0,
+  resume_done_skips INTEGER NOT NULL DEFAULT 0,
+  created_at    TIMESTAMP NOT NULL,
+  updated_at    TIMESTAMP NOT NULL
+);
+
+-- 轮次内按详情地址（岩芯）登记的采集状态：行数只随“本轮待核实地址数”增长，
+-- 轮次结束即删除，不为续跑保存任何响应体或逐次尝试明细。
+CREATE TABLE IF NOT EXISTS review_core_entries (
+  round_id             INTEGER NOT NULL,
+  core_id              VARCHAR NOT NULL,
+  status               VARCHAR NOT NULL DEFAULT 'PENDING',
+  logical_fetched      BOOLEAN NOT NULL DEFAULT false,
+  shown_revision       INTEGER,
+  shown_published_seq  INTEGER,
+  attempts             INTEGER NOT NULL DEFAULT 0,
+  last_error           VARCHAR,
+  updated_at           TIMESTAMP NOT NULL,
+  PRIMARY KEY (round_id, core_id)
 );
 `;
 
@@ -256,13 +324,6 @@ export class Database {
       ],
     );
     return "inserted";
-  }
-
-  async getIdentification(coreId: string, revision: number): Promise<IdentificationRow | null> {
-    return this.one<IdentificationRow>(
-      `SELECT * FROM identifications WHERE core_id = ? AND revision = ?`,
-      [coreId, revision],
-    );
   }
 
   /** 记录一次详情抓取尝试。 */
@@ -403,7 +464,7 @@ export class Database {
     await this.exec(
       `UPDATE run_state SET
          active_run_id = ?, mode = ?, catalog_page_cursor = ?, catalog_total_pages = ?,
-         correction_page_cursor = ?, correction_total_pages = ?,
+         correction_page_cursor = ?, correction_total_pages = ?, total_published = ?,
          last_contiguous_verified_seq = ?, full_completed = ?, full_completed_at = ?,
          last_catchup_at = ?, updated_at = ?
        WHERE id = 1`,
@@ -414,6 +475,7 @@ export class Database {
         merged.catalog_total_pages,
         merged.correction_page_cursor,
         merged.correction_total_pages,
+        merged.total_published,
         merged.last_contiguous_verified_seq,
         merged.full_completed,
         merged.full_completed_at,
@@ -482,6 +544,247 @@ export class Database {
 
   async getRun(runId: number): Promise<RunRow | null> {
     return this.one<RunRow>(`SELECT * FROM runs WHERE id = ?`, [runId]);
+  }
+
+  // ---------- 复查轮（每轮每详情地址只采集一次，状态落库支持续跑） ----------
+
+  /** 取当前阶段未结束的复查轮；强杀重启后返回它以继续原轮。 */
+  async getOpenReviewRound(phase: ReviewPhase): Promise<ReviewRoundRow | null> {
+    return this.one<ReviewRoundRow>(
+      `SELECT * FROM review_rounds WHERE phase = ? AND status = 'OPEN' ORDER BY id DESC LIMIT 1`,
+      [phase],
+    );
+  }
+
+  /** 新建一轮复查，并为每个有待核实修订的详情地址登记一条条目。 */
+  async createReviewRound(
+    phase: ReviewPhase,
+    runId: number,
+    coreIds: string[],
+  ): Promise<number> {
+    const seqRow = await this.one<{ n: number }>(
+      `SELECT CAST(nextval('review_rounds_id_seq') AS INTEGER) AS n`,
+    );
+    const id = Number(seqRow?.n ?? 1);
+    await this.exec(
+      `INSERT INTO review_rounds
+         (id, phase, run_id, status, restarts, cores_total, max_cores_seen,
+          cores_done, cores_failed, detail_requests, created_at, updated_at)
+       VALUES (?, ?, ?, 'OPEN', 0, ?, ?, 0, 0, 0, now(), now())`,
+      [id, phase, runId, coreIds.length, coreIds.length],
+    );
+    for (const coreId of coreIds) {
+      await this.exec(
+        `INSERT INTO review_core_entries
+           (round_id, core_id, status, attempts, updated_at)
+         VALUES (?, ?, 'PENDING', 0, now())
+         ON CONFLICT (round_id, core_id) DO NOTHING`,
+        [id, coreId],
+      );
+    }
+    return id;
+  }
+
+  /** 续跑原轮：关联到新运行并累计重启次数（条目状态原样沿用）。 */
+  async reattachReviewRound(roundId: number, runId: number): Promise<void> {
+    await this.exec(
+      `UPDATE review_rounds
+          SET run_id = ?, restarts = restarts + 1, updated_at = now()
+        WHERE id = ?`,
+      [runId, roundId],
+    );
+  }
+
+  /**
+   * 确保本轮某地址已在轮次条目内。用于续跑/运行中新登记的同址修订：
+   * 已存在（含 DONE）时不回退状态，保证同址本轮只采集一次。
+   */
+  async ensureReviewCoreEntry(roundId: number, coreId: string): Promise<void> {
+    await this.exec(
+      `INSERT INTO review_core_entries
+         (round_id, core_id, status, attempts, updated_at)
+       VALUES (?, ?, 'PENDING', 0, now())
+       ON CONFLICT (round_id, core_id) DO NOTHING`,
+      [roundId, coreId],
+    );
+    // 新补登的地址才计入轮次地址总数；已存在的（含 DONE）保持不变。
+    await this.exec(
+      `UPDATE review_rounds
+          SET cores_total = (
+                SELECT CAST(COUNT(*) AS INTEGER) FROM review_core_entries WHERE round_id = ?
+              ),
+              max_cores_seen = (
+                SELECT MAX(v) FROM (
+                  SELECT max_cores_seen AS v FROM review_rounds WHERE id = ?
+                  UNION ALL
+                  SELECT CAST(COUNT(*) AS INTEGER) AS v FROM review_core_entries WHERE round_id = ?
+                )
+              ),
+              updated_at = now()
+        WHERE id = ?`,
+      [roundId, roundId, roundId, roundId],
+    );
+  }
+
+  /**
+   * 记录一次“逻辑详情采集”：把该地址的 logical_fetched 置真（已置真则不变），
+   * 再按当前条目重算轮次采集数。这样临时失败重试、跨重启续跑都不会让同一地址
+   * 在同一轮被重复计数，恒有 detail_requests ≤ 轮次不同地址数。
+   */
+  async incrementDetailRequests(roundId: number, coreId: string): Promise<void> {
+    await this.exec(
+      `UPDATE review_core_entries
+          SET logical_fetched = true, updated_at = now()
+        WHERE round_id = ? AND core_id = ?`,
+      [roundId, coreId],
+    );
+    await this.exec(
+      `UPDATE review_rounds
+          SET detail_requests = (
+                SELECT CAST(COUNT(*) AS INTEGER) FROM review_core_entries
+                 WHERE round_id = ? AND logical_fetched = true
+              ),
+              updated_at = now()
+        WHERE id = ?`,
+      [roundId, roundId],
+    );
+  }
+
+  async getReviewCoreEntry(roundId: number, coreId: string): Promise<ReviewCoreEntryRow | null> {
+    return this.one<ReviewCoreEntryRow>(
+      `SELECT * FROM review_core_entries WHERE round_id = ? AND core_id = ?`,
+      [roundId, coreId],
+    );
+  }
+
+  /** 本轮尚需采集（未成功过）的地址：DONE 不返回，续跑时本轮不再请求。 */
+  async listReviewCoreEntries(roundId: number): Promise<ReviewCoreEntryRow[]> {
+    return this.all<ReviewCoreEntryRow>(
+      `SELECT * FROM review_core_entries
+        WHERE round_id = ? AND status <> 'DONE'
+        ORDER BY core_id`,
+      [roundId],
+    );
+  }
+
+  /** 按状态统计本轮逐地址条目（用于续跑时核算跳过的 DONE 地址数）。 */
+  async countReviewCoreEntries(
+    roundId: number,
+  ): Promise<{ total: number; done: number; failed: number; pending: number }> {
+    const row = await this.one<{ total: number; done: number; failed: number; pending: number }>(
+      `SELECT
+         CAST(COUNT(*) AS INTEGER) AS total,
+         CAST(COUNT(*) FILTER (WHERE status = 'DONE') AS INTEGER) AS done,
+         CAST(COUNT(*) FILTER (WHERE status = 'FAILED') AS INTEGER) AS failed,
+         CAST(COUNT(*) FILTER (WHERE status = 'PENDING') AS INTEGER) AS pending
+       FROM review_core_entries WHERE round_id = ?`,
+      [roundId],
+    );
+    return {
+      total: Number(row?.total ?? 0),
+      done: Number(row?.done ?? 0),
+      failed: Number(row?.failed ?? 0),
+      pending: Number(row?.pending ?? 0),
+    };
+  }
+
+  /** 续跑时累计“因上轮已 DONE 而本轮跳过、不再请求”的地址数（持久化，避免竞态观察不到）。 */
+  async addResumeDoneSkips(roundId: number, count: number): Promise<void> {
+    if (count <= 0) return;
+    await this.exec(
+      `UPDATE review_rounds SET resume_done_skips = resume_done_skips + ?, updated_at = now()
+        WHERE id = ?`,
+      [count, roundId],
+    );
+  }
+
+  /** 一次详情采集成功（无论核实通过还是详情仍旧）：该地址本轮标记 DONE，不再补发。 */
+  async markReviewCoreDone(
+    roundId: number,
+    coreId: string,
+    shownRevision: number,
+    shownPublishedSeq: number,
+  ): Promise<void> {
+    await this.exec(
+      `UPDATE review_core_entries
+          SET status = 'DONE', shown_revision = ?, shown_published_seq = ?,
+              updated_at = now()
+        WHERE round_id = ? AND core_id = ?`,
+      [shownRevision, shownPublishedSeq, roundId, coreId],
+    );
+    // 按当前状态互斥统计：FAILED 后重试成功的地址只计入 DONE，不重复计数。
+    await this.exec(
+      `UPDATE review_rounds
+          SET cores_done = (
+                SELECT CAST(COUNT(*) AS INTEGER) FROM review_core_entries
+                 WHERE round_id = ? AND status = 'DONE'
+              ),
+              cores_failed = (
+                SELECT CAST(COUNT(*) AS INTEGER) FROM review_core_entries
+                 WHERE round_id = ? AND status = 'FAILED'
+              ),
+              max_cores_seen = (
+                SELECT MAX(v) FROM (
+                  SELECT max_cores_seen AS v FROM review_rounds WHERE id = ?
+                  UNION ALL
+                  SELECT CAST(COUNT(*) AS INTEGER) AS v FROM review_core_entries WHERE round_id = ?
+                )
+              ),
+              updated_at = now()
+        WHERE id = ?`,
+      [roundId, roundId, roundId, roundId, roundId],
+    );
+  }
+
+  /** 临时失败：记录失败原因并累加尝试次数，后续轮次/重试照常再抓。 */
+  async markReviewCoreFailed(roundId: number, coreId: string, error: string): Promise<void> {
+    await this.exec(
+      `UPDATE review_core_entries
+          SET status = 'FAILED', attempts = attempts + 1, last_error = ?, updated_at = now()
+        WHERE round_id = ? AND core_id = ?`,
+      [error, roundId, coreId],
+    );
+    await this.exec(
+      `UPDATE review_rounds
+          SET cores_failed = (
+                SELECT CAST(COUNT(*) AS INTEGER) FROM review_core_entries
+                 WHERE round_id = ? AND status = 'FAILED'
+              ),
+              updated_at = now()
+        WHERE id = ?`,
+      [roundId, roundId],
+    );
+  }
+
+  async getReviewRound(roundId: number): Promise<ReviewRoundRow | null> {
+    return this.one<ReviewRoundRow>(`SELECT * FROM review_rounds WHERE id = ?`, [roundId]);
+  }
+
+  /**
+   * 结束复查轮：保留轮次汇总行（数量仅与复查轮数同阶，远小于待核实条目量），
+   * 删除逐地址条目——续跑所需的额外数据量只随本轮待核实地址数增长。
+   */
+  async closeReviewRound(roundId: number): Promise<void> {
+    await this.exec(`DELETE FROM review_core_entries WHERE round_id = ?`, [roundId]);
+    await this.exec(
+      `UPDATE review_rounds SET status = 'CLOSED', updated_at = now() WHERE id = ?`,
+      [roundId],
+    );
+  }
+
+  /** 当前仍在进行中的复查轮（任意阶段），用于统计与续跑判断。 */
+  async listOpenReviewRounds(): Promise<ReviewRoundRow[]> {
+    return this.all<ReviewRoundRow>(
+      `SELECT * FROM review_rounds WHERE status = 'OPEN' ORDER BY id`,
+    );
+  }
+
+  /** 有待核实修订的全部去重详情地址（岩芯编号）。 */
+  async listPendingCoreIds(): Promise<string[]> {
+    const rows = await this.all<{ core_id: string }>(
+      `SELECT DISTINCT core_id FROM identifications WHERE status = 'PENDING' ORDER BY core_id`,
+    );
+    return rows.map((r) => r.core_id);
   }
 }
 

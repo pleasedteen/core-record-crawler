@@ -187,10 +187,28 @@ export class MockArchiveSite {
     const idx = page - 1;
     const items = pages[idx] ?? [];
     const rows: string[] = [];
+    // 确定性挑选部分岩芯：在目录里把同一详情地址挂上多个修订链接，
+    // 模拟“一个详情地址承载多个修订”，采集端必须逐个登记、不得漏登。
+    const multiRevRng = mulberry32(20261122);
+    const multiRevCores = new Set(
+      [...this.cores.keys()]
+        .filter((coreId) => (this.cores.get(coreId)?.length ?? 0) > 1 && multiRevRng() < 0.35)
+        .slice(0, 8),
+    );
     for (const rev of items) {
-      rows.push(
-        `      <li><a href="/core/${rev.coreId}">${rev.coreId}</a> <span class="rev">修订 r${rev.revision}</span> <span class="updated">更新于 ${rev.publishedAt}</span></li>`,
-      );
+      const list = this.cores.get(rev.coreId) ?? [];
+      if (multiRevCores.has(rev.coreId) && list.length > 1) {
+        // 同一详情地址先挂历史修订、再挂当前修订（不同 revision，URL 完全相同）
+        for (const r of list) {
+          rows.push(
+            `      <li><a href="/core/${r.coreId}">${r.coreId}</a> <span class="rev">修订 r${r.revision}</span> <span class="updated">更新于 ${r.publishedAt}</span></li>`,
+          );
+        }
+      } else {
+        rows.push(
+          `      <li><a href="/core/${rev.coreId}">${rev.coreId}</a> <span class="rev">修订 r${rev.revision}</span> <span class="updated">更新于 ${rev.publishedAt}</span></li>`,
+        );
+      }
       // 重复链接：约 1/3 的条目在目录中再出现一次（同一详情地址、同一修订）
       if (this.rng() < 0.33) {
         rows.push(
